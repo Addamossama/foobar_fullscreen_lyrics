@@ -1,12 +1,17 @@
-"""Foobar Fullscreen Lyrics v6
+"""Foobar Fullscreen Lyrics v8
 
 Fullscreen synced lyrics for foobar2000 (via Beefweb) with an ambient,
 artwork-driven look.  Requires: Python 3.10+, Pillow, foobar2000 + Beefweb.
+
+v8 stores settings.json and lyrics_cache.json next to the script by default,
+with an in-panel "Data location" setting to switch between script folder and
+%APPDATA%.  Files migrate automatically when you switch.
 """
-import bisect, colorsys, io, json, math, queue, re, threading, time
+import bisect, colorsys, io, json, math, os, queue, re, sys, threading, time
 import urllib.parse, urllib.request
 import tkinter as tk
 import tkinter.font as tkfont
+from pathlib import Path
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps, ImageTk
 
 try:  # crisp text on Windows high-DPI screens
@@ -18,20 +23,225 @@ except Exception:
 # ----------------------------------------------------------------- settings
 BEEFWEB = "http://127.0.0.1:8880/api"
 LRCLIB = "https://lrclib.net/api"
+NETEASE = "https://music.163.com/api"
 POLL_S = 0.15          # how often Beefweb is polled
 TICK_MS = 16           # UI frame interval (~60 fps)
-LYRIC_LEAD = 0.15      # highlight a line slightly early (seconds)
-UI_HIDE_AFTER = 3.5    # controls fade out after this many idle seconds
+
 UI_FONTS = ("Segoe UI Variable Display", "Segoe UI", "SF Pro Display",
             "Helvetica Neue", "Inter", "Noto Sans", "DejaVu Sans", "Helvetica")
 DEFAULT_ACCENT = (139, 108, 255)
 WHITE = (255, 255, 255)
-UA = {"User-Agent": "FoobarLyrics/6.0"}
+UA = {"User-Agent": "FoobarLyrics/8.0"}
+
+# ----------------------------------------------------------- storage paths
+def _script_dir() -> Path:
+    if getattr(sys, "frozen", False):     # PyInstaller / frozen exe
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+SCRIPT_DIR = _script_dir()
+APPDATA_DIR = Path(os.getenv("APPDATA") or Path.home()) / "FoobarLyrics"
+
+
+def _bootstrap_settings_path() -> Path:
+    """Locate settings.json before we can read the storage_location setting.
+
+    Script folder wins if both exist; a fresh install defaults to the script
+    folder (matching the v8 default of storage_location = 'script')."""
+    script_settings = SCRIPT_DIR / "settings.json"
+    appdata_settings = APPDATA_DIR / "settings.json"
+    if script_settings.exists():
+        return script_settings
+    if appdata_settings.exists():
+        return appdata_settings
+    return script_settings
+
+
+def _dir_for(location: str) -> Path:
+    return APPDATA_DIR if location == "appdata" else SCRIPT_DIR
+
+
+DEFAULT_SETTINGS = {
+    "lyric_lead": 0.15,          # highlight a line slightly early (seconds)
+    "ui_hide_after": 3.5,        # controls fade out after this many idle seconds
+    "show_translation": True,    # show NetEase translated lyrics under each line
+    "lyric_source": "auto",      # "auto" / "lrclib" / "netease"
+    "storage_location": "script",  # "script" (next to the .py) / "appdata"
+    "font_scale": 1.0,           # global text size multiplier
+    "bg_darkness": 1.0,          # background darkening strength
+    "bg_blur": 1.0,              # background blur strength
+    "show_controls": True,
+    "show_hint": True,
+}
+
+
+class Settings:
+    """Tiny JSON-backed settings store.  The path is mutable so we can
+    migrate to a new storage_location at runtime."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.data = dict(DEFAULT_SETTINGS)
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                for k in DEFAULT_SETTINGS:
+                    if k in loaded:
+                        self.data[k] = loaded[k]
+        except Exception:
+            pass
+
+    def save(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, indent=2, ensure_ascii=False)
+            tmp.replace(self.path)
+        except Exception:
+            pass
+
+    def get(self, k, default=None):
+        return self.data.get(k, DEFAULT_SETTINGS.get(k, default))
+
+    def set(self, k, v, save=True):
+        self.data[k] = v
+        if save:
+            self.save()
+
+    def __getitem__(self, k):
+        return self.get(k)
+
+    def __setitem__(self, k, v):
+        self.set(k, v)
+
+    def reset(self):
+        self.data = dict(DEFAULT_SETTINGS)
+        self.save()
+
+
+class LyricCache:
+    """Persisted {artist||title||album: [lines, source]} store."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.data = {}
+        self._dirty = False
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                # Each value is [lines, source]; lines are lists of [t, text, trans]
+                self.data = {k: v for k, v in d.items()
+                             if isinstance(v, list) and len(v) >= 2}
+        except Exception:
+            self.data = {}
+
+    def save(self, force=False):
+        if not self._dirty and not force:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False)
+            tmp.replace(self.path)
+            self._dirty = False
+        except Exception:
+            pass
+
+    @staticmethod
+    def _key(track) -> str:
+        return "||".join(track)
+
+    def get(self, track):
+        v = self.data.get(self._key(track))
+        if not v:
+            return None
+        lines = [tuple(x) for x in v[0] if isinstance(x, (list, tuple)) and len(x) >= 2]
+        if not lines:
+            return None
+        # Normalize each entry to (time, text, translation)
+        norm = []
+        for ln in lines:
+            t = float(ln[0])
+            txt = str(ln[1]) if len(ln) > 1 else ""
+            tr = str(ln[2]) if len(ln) > 2 else ""
+            norm.append((t, txt, tr))
+        return norm, str(v[1])
+
+    def put(self, track, lines, source):
+        self.data[self._key(track)] = [[[t, txt, tr] for (t, txt, tr) in lines], source]
+        self._dirty = True
+        self.save()
+
+    def clear(self):
+        self.data = {}
+        self._dirty = True
+        self.save(force=True)
+
+    def size(self) -> int:
+        return len(self.data)
+
+
+SETTINGS_PATH = _bootstrap_settings_path()
+SETTINGS = Settings(SETTINGS_PATH)
+CACHE = LyricCache(SETTINGS_PATH.parent / "lyrics_cache.json")
+
+# name, label, kind, [slider: lo, hi, step, unit] / [choice: options]
+SETTINGS_ROWS = [
+    ("lyric_lead",       "Lyric lead",          "slider", 0.0, 1.0, 0.05, "s"),
+    ("ui_hide_after",    "Auto-hide UI after",  "slider", 1.0, 15.0, 0.5, "s"),
+    ("lyric_source",     "Lyric source",        "choice", ["auto", "lrclib", "netease"]),
+    ("show_translation", "Show translation",    "toggle"),
+    ("storage_location", "Data location",       "choice", ["script", "appdata"]),
+    ("font_scale",       "Font scale",          "slider", 0.75, 1.6, 0.05, "×"),
+    ("bg_darkness",      "Background darkness", "slider", 0.3, 1.6, 0.1,  "×"),
+    ("bg_blur",          "Background blur",     "slider", 0.5, 2.0, 0.1,  "×"),
+    ("show_controls",    "Show controls",       "toggle"),
+    ("show_hint",        "Show hint",           "toggle"),
+]
+
+
+def migrate_storage(new_location: str):
+    """Move settings.json + lyrics_cache.json to the new folder and delete
+    the old copies.  Safe to call even if nothing actually moves."""
+    new_dir = _dir_for(new_location)
+    new_settings = new_dir / "settings.json"
+    new_cache = new_dir / "lyrics_cache.json"
+    old_settings = SETTINGS.path
+    old_cache = CACHE.path
+
+    if new_settings != old_settings:
+        SETTINGS.path = new_settings
+        SETTINGS.save()
+        try:
+            if old_settings.exists() and old_settings != new_settings:
+                old_settings.unlink()
+        except Exception:
+            pass
+
+    if new_cache != old_cache:
+        CACHE.path = new_cache
+        CACHE.save(force=True)
+        try:
+            if old_cache.exists() and old_cache != new_cache:
+                old_cache.unlink()
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------- http
-def get_json(url, timeout=5):
-    req = urllib.request.Request(url, headers=UA)
+def get_json(url, timeout=5, headers=None):
+    req = urllib.request.Request(url, headers={**UA, **(headers or {})})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
@@ -71,7 +281,7 @@ def clean_title(t):
     return t.strip()
 
 
-def fetch_lyrics(artist, title, album, duration):
+def fetch_lrclib(artist, title, album, duration):
     """Exact LRCLIB match first, then a fuzzy search fallback."""
     def synced(obj):
         return parse_lrc(obj.get("syncedLyrics") or "") if isinstance(obj, dict) else []
@@ -107,6 +317,97 @@ def fetch_lyrics(artist, title, album, duration):
             if lines:
                 return lines
     return []
+
+
+NE_HEADERS = {"Referer": "https://music.163.com/",
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
+CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
+CREDIT_RE = re.compile(r"^\s*(作词|作曲|编曲|制作人?|监制|混音|母带|词|曲|lyrics?|composer|arranger|producer)\s*[:：]",
+                       re.I)
+
+
+def norm(s):
+    return re.sub(r"[\W_]+", "", (s or "").lower())
+
+
+def parse_netease_lrc(text):
+    out = []
+    for t, line in parse_lrc(text):
+        if line.startswith("{") and line.endswith("}"):
+            continue
+        if t < 30 and CREDIT_RE.match(line):      # "作词 : xxx" credit lines
+            continue
+        out.append((t, line))
+    return out
+
+
+def merge_translation(lines, trans):
+    tmap = {round(t * 100): x for t, x in trans if x}
+    return [(t, x, tmap.get(round(t * 100), "")) for t, x in lines]
+
+
+def fetch_netease(artist, title, duration):
+    """NetEase Cloud Music: search -> best match -> synced lyric (+ translation)."""
+    def title_ok(name):
+        a, b = norm(title), norm(name)
+        return bool(a and b and (a in b or b in a))
+
+    nartist = norm(artist)
+    queries = dict.fromkeys([f"{title} {artist}".strip(),
+                             f"{clean_title(title)} {artist}".strip(), clean_title(title)])
+    for q in queries:
+        if not q:
+            continue
+        try:
+            res = get_json(NETEASE + "/search/get?" + urllib.parse.urlencode(
+                {"s": q, "type": 1, "limit": 10, "offset": 0}), 8, NE_HEADERS)
+            songs = (res.get("result") or {}).get("songs") or []
+        except Exception:
+            continue
+        best = None
+        for s in songs:
+            name = s.get("name") or ""
+            if not (title_ok(name) or title_ok(clean_title(name))):
+                continue
+            dur_ms = s.get("duration") or 0
+            diff = abs(dur_ms / 1000 - duration) if duration and dur_ms else 0
+            if duration and diff > 12:
+                continue
+            arts = [norm(x.get("name")) for x in (s.get("artists") or [])]
+            pen = 0 if any(a and nartist and (a in nartist or nartist in a) for a in arts) else 6
+            if best is None or diff + pen < best[0]:
+                best = (diff + pen, s.get("id"))
+        if not best or best[1] is None:
+            continue
+        try:
+            d = get_json(NETEASE + f"/song/lyric?id={best[1]}&lv=1&kv=1&tv=-1", 8, NE_HEADERS)
+        except Exception:
+            continue
+        lines = parse_netease_lrc((d.get("lrc") or {}).get("lyric") or "")
+        if lines:
+            trans = parse_netease_lrc((d.get("tlyric") or {}).get("lyric") or "")
+            return merge_translation(lines, trans)
+    return []
+
+
+def fetch_lyrics(artist, title, album, duration):
+    """Returns (lines, source). Each line is (time, text, translation)."""
+    source = SETTINGS["lyric_source"]
+    order = ["lrclib", "netease"]
+    if source == "netease" or (source == "auto" and CJK_RE.search(artist + title)):
+        order.reverse()
+    for src in order:
+        try:
+            if src == "lrclib":
+                lines = [(t, x, "") for t, x in fetch_lrclib(artist, title, album, duration)]
+            else:
+                lines = fetch_netease(artist, title, duration)
+        except Exception:
+            lines = []
+        if lines:
+            return lines, ("NetEase" if src == "netease" else "LRCLIB")
+    return [], ""
 
 
 # ------------------------------------------------------------------ helpers
@@ -157,6 +458,13 @@ def ellipsize(text, font, maxw):
     return text.rstrip() + "…"
 
 
+def shorten_path(p: Path, maxlen: int = 46) -> str:
+    s = str(p)
+    if len(s) <= maxlen:
+        return s
+    return "…" + s[-(maxlen - 1):]
+
+
 # ------------------------------------------------- image / background assets
 def cover_crop(im, w, h):
     r, ir = w / h, im.width / im.height
@@ -188,15 +496,17 @@ def pick_accent(im):
     return (int(r * 255), int(g * 255), int(b * 255))
 
 
-def shade(bg):
+def shade(bg, darkness=1.0):
     """Real-alpha darkening: heavier on the lyric side, soft top/bottom vignette."""
+    d = max(0.0, float(darkness))
     w, h = bg.size
-    grad = Image.linear_gradient("L")                       # black top -> white bottom
+    grad = Image.linear_gradient("L")
     hor = grad.rotate(90).resize((w, h), Image.Resampling.BILINEAR)
-    bg.paste((0, 0, 0), (0, 0, w, h), hor.point(lambda v: int(v * 0.50)))
+    bg.paste((0, 0, 0), (0, 0, w, h),
+             hor.point(lambda v: min(255, int(v * 0.50 * d))))
     ver = grad.resize((w, h), Image.Resampling.BILINEAR)
-    top = ImageOps.invert(ver).point(lambda v: int((v / 255) ** 3 * 150))
-    bot = ver.point(lambda v: int((v / 255) ** 3 * 190))
+    top = ImageOps.invert(ver).point(lambda v: min(255, int((v / 255) ** 3 * 150 * d)))
+    bot = ver.point(lambda v: min(255, int((v / 255) ** 3 * 190 * d)))
     bg.paste((0, 0, 0), (0, 0, w, h), top)
     bg.paste((0, 0, 0), (0, 0, w, h), bot)
     return bg
@@ -233,7 +543,8 @@ def placeholder_cover(cs, accent):
     img = ImageOps.colorize(ver, black=mix((30, 30, 44), accent, .35), white=(10, 10, 16))
     d, c = ImageDraw.Draw(img), cs / 2
     for r in (.46, .40, .34, .28):
-        d.ellipse([c - cs * r, c - cs * r, c + cs * r, c + cs * r], outline=mix((10, 10, 16), accent, .22))
+        d.ellipse([c - cs * r, c - cs * r, c + cs * r, c + cs * r],
+                  outline=mix((10, 10, 16), accent, .22))
     r = cs * .12
     d.ellipse([c - r, c - r, c + r, c + r], fill=mix((20, 20, 30), accent, .7))
     r = cs * .014
@@ -241,7 +552,7 @@ def placeholder_cover(cs, accent):
     return img
 
 
-def build_assets(raw, w, h, cs):
+def build_assets(raw, w, h, cs, darkness=1.0, blur=1.0):
     if raw is None:
         accent = DEFAULT_ACCENT
         bg = fallback_bg(w, h, accent)
@@ -249,12 +560,13 @@ def build_assets(raw, w, h, cs):
     else:
         accent = pick_accent(raw)
         sw, sh = max(64, w // 10), max(36, h // 10)
-        small = cover_crop(raw, sw, sh).filter(ImageFilter.GaussianBlur(max(6, sw // 9)))
+        blur_px = max(2, int(max(6, sw // 9) * max(0.2, blur)))
+        small = cover_crop(raw, sw, sh).filter(ImageFilter.GaussianBlur(blur_px))
         small = ImageEnhance.Color(small).enhance(1.45)
         small = ImageEnhance.Brightness(small).enhance(.68)
         bg = small.resize((w, h), Image.Resampling.BICUBIC)
         cover = cover_crop(raw, cs, cs)
-    bg = shade(bg)
+    bg = shade(bg, darkness)
     tint = bg.crop((w // 2, 0, w, h)).resize((1, 1), Image.Resampling.BOX).getpixel((0, 0))
     cover, pad = frame_cover(cover, cs)
     return {"bg": bg, "cover": cover, "pad": pad, "accent": accent, "tint": tuple(tint[:3])}
@@ -275,7 +587,6 @@ class App:
         self.family = next((f for f in UI_FONTS if f in avail), "Helvetica")
         self._fonts = {}
 
-        # playback state (remote = written by poll thread, read by UI thread)
         now = time.perf_counter()
         self.remote = {"seq": 0, "ok": False, "a": "", "t": "", "al": "",
                        "pos": 0.0, "dur": 0.0, "playing": False, "stamp": now}
@@ -285,15 +596,15 @@ class App:
         self.prev_connected = None
         self.track_key, self.track = None, ("", "", "")
 
-        # lyrics
         self.lines, self.times, self.lines_ver = [], [], 0
+        self.lyric_source = ""
+        self.line_trows, self.line_oh = [], []
         self.lyric_state = "idle"
         self.focus, self.line_rows, self.line_y, self.line_h = [], [], [], []
         self.lyr_alpha, self.current = 1.0, -1
         self.auto_follow = True
         self.scroll = self.target_scroll = 0.0
 
-        # visuals
         self.art_raw, self.art_ver = None, 0
         self.bg_photo = self.cover_photo = None
         self.cover_pad = 0
@@ -303,7 +614,6 @@ class App:
         self.static_dirty = True
         self.geo, self.size = None, (0, 0)
 
-        # interaction
         self.mx = self.my = -1
         self.last_move = now
         self.ui_alpha = 1.0
@@ -312,6 +622,12 @@ class App:
         self.cursor = "arrow"
         self.last_tick = now
         self.events = queue.Queue()
+
+        self.settings_open = False
+        self.settings_sel = 0
+        self.settings_lay = None
+        self.settings_toast = ""       # transient message at bottom of panel
+        self.settings_toast_until = 0.0
 
         c = self.canvas = tk.Canvas(root, bg="#050508", highlightthickness=0, cursor="arrow")
         c.pack(fill="both", expand=True)
@@ -323,15 +639,17 @@ class App:
         c.bind("<Button-1>", self.on_press)
         c.bind("<B1-Motion>", self.on_drag)
         c.bind("<ButtonRelease-1>", self.on_release)
-        c.bind("<MouseWheel>", lambda e: self.wheel(-1 if e.delta > 0 else 1))
-        c.bind("<Button-4>", lambda e: self.wheel(-1))
-        c.bind("<Button-5>", lambda e: self.wheel(1))
+        c.bind("<MouseWheel>", lambda e: self.on_wheel(e.delta))
+        c.bind("<Button-4>", lambda e: self.on_wheel(1))
+        c.bind("<Button-5>", lambda e: self.on_wheel(-1))
+
         root.bind("<F11>", self.toggle_fullscreen)
-        root.bind("<Escape>", self.exit_fullscreen)
-        root.bind("<space>", lambda e: self.playpause())
-        root.bind("<Left>", lambda e: self.skip(-10))
-        root.bind("<Right>", lambda e: self.skip(10))
+        for k in ("<Left>", "<Right>", "<Up>", "<Down>", "<Escape>", "<space>"):
+            root.bind(k, lambda e, key=k: self.on_key(key))
         root.bind("<f>", lambda e: self.follow_now())
+        root.bind("<s>", lambda e: self.toggle_settings())
+        root.bind("<r>", lambda e: self.refetch_lyrics())
+        root.bind("<v>", lambda e: self.toggle_translation())
         root.protocol("WM_DELETE_WINDOW", self.close)
 
         threading.Thread(target=self.poll_loop, daemon=True).start()
@@ -339,6 +657,7 @@ class App:
 
     # ------------------------------------------------------------- plumbing
     def font(self, px, weight="normal"):
+        px = max(8, int(round(px * SETTINGS["font_scale"])))
         k = (px, weight)
         if k not in self._fonts:
             self._fonts[k] = tkfont.Font(family=self.family, size=-px, weight=weight)
@@ -346,6 +665,11 @@ class App:
 
     def close(self):
         self.alive = False
+        try:
+            SETTINGS.save()
+            CACHE.save(force=True)
+        except Exception:
+            pass
         self.root.destroy()
 
     def command(self, path, data=None):
@@ -357,7 +681,8 @@ class App:
         threading.Thread(target=run, daemon=True).start()
 
     def poll_loop(self):
-        url = BEEFWEB + "/player?" + urllib.parse.urlencode({"columns": "%artist%,%title%,%album%"})
+        url = BEEFWEB + "/player?" + urllib.parse.urlencode(
+            {"columns": "%artist%,%title%,%album%"})
         seq = 0
         while self.alive:
             t0 = time.perf_counter()
@@ -426,21 +751,32 @@ class App:
     def on_track_change(self, key, dur):
         self.track_key = self.track = key
         self.lines, self.times, self.focus = [], [], []
+        self.lyric_source = ""
         self.lines_ver += 1
         self.lyric_state, self.current = "loading", -1
         self.scroll = self.target_scroll = 0.0
         self.auto_follow = True
         self.static_dirty = True
         self.root.title(" — ".join(x for x in key[:2] if x) or "Foobar Lyrics")
-        threading.Thread(target=self.lyrics_worker, args=(key, dur), daemon=True).start()
+        threading.Thread(target=self.lyrics_worker, args=(key, dur, False), daemon=True).start()
         threading.Thread(target=self.art_worker, args=(key,), daemon=True).start()
 
-    def lyrics_worker(self, key, dur):
+    def lyrics_worker(self, key, dur, force=False):
+        if not force:
+            hit = CACHE.get(key)
+            if hit:
+                self.events.put(("lyrics", key, hit[0], hit[1]))
+                return
         try:
-            lines = fetch_lyrics(key[0], key[1], key[2], dur)
+            lines, src = fetch_lyrics(key[0], key[1], key[2], dur)
         except Exception:
-            lines = []
-        self.events.put(("lyrics", key, lines))
+            lines, src = [], ""
+        if lines:
+            try:
+                CACHE.put(key, lines, src)
+            except Exception:
+                pass
+        self.events.put(("lyrics", key, lines, src))
 
     def art_worker(self, key):
         raw = None
@@ -457,9 +793,9 @@ class App:
                 time.sleep(0.6)
         self.events.put(("art", key, raw))
 
-    def asset_worker(self, seq, raw, w, h, cs):
+    def asset_worker(self, seq, raw, w, h, cs, darkness, blur):
         try:
-            self.events.put(("assets", seq, build_assets(raw, w, h, cs)))
+            self.events.put(("assets", seq, build_assets(raw, w, h, cs, darkness, blur)))
         except Exception:
             import traceback
             traceback.print_exc()
@@ -471,7 +807,7 @@ class App:
             except queue.Empty:
                 return
             if ev[0] == "lyrics" and ev[1] == self.track_key:
-                self.set_lines(ev[2])
+                self.set_lines(ev[2], ev[3])
             elif ev[0] == "art" and ev[1] == self.track_key:
                 self.art_raw = ev[2]
                 self.art_ver += 1
@@ -479,9 +815,10 @@ class App:
             elif ev[0] == "assets" and ev[1] == self.asset_seq:
                 self.apply_assets(ev[2])
 
-    def set_lines(self, lines):
+    def set_lines(self, lines, source=""):
         self.lines = lines
-        self.times = [t for t, _ in lines]
+        self.lyric_source = source
+        self.times = [ln[0] for ln in lines]
         self.focus = [0.0] * len(lines)
         self.lines_ver += 1
         self.lyric_state = "found" if lines else "none"
@@ -491,17 +828,43 @@ class App:
             self.layout_lines()
             self.scroll = self.target_scroll = self.center_of(0) if lines else 0.0
 
+    def refetch_lyrics(self):
+        if self.track_key is None:
+            return
+        # drop cached entry for this track
+        try:
+            CACHE.data.pop(CACHE._key(self.track_key), None)
+            CACHE.save(force=True)
+        except Exception:
+            pass
+        self.lines, self.times, self.focus = [], [], []
+        self.lyric_source = ""
+        self.lines_ver += 1
+        self.lyric_state, self.current = "loading", -1
+        self.static_dirty = True
+        threading.Thread(target=self.lyrics_worker,
+                         args=(self.track_key, self.duration, True), daemon=True).start()
+
+    def toggle_translation(self):
+        SETTINGS["show_translation"] = not SETTINGS["show_translation"]
+        if self.geo and self.lines:
+            self.layout_lines()
+
     def manage_assets(self, now):
         w, h = self.size
-        sig = (w, h, self.geo["cs"], self.art_ver)
+        sig = (w, h, self.geo["cs"], self.art_ver,
+               round(float(SETTINGS["bg_darkness"]), 2),
+               round(float(SETTINGS["bg_blur"]), 2))
         if sig != self.want_sig:
             self.want_sig, self.want_since = sig, now
         if sig != self.built_sig and (self.immediate or now - self.want_since >= 0.25):
             self.immediate = False
             self.built_sig = sig
             self.asset_seq += 1
-            threading.Thread(target=self.asset_worker, daemon=True,
-                             args=(self.asset_seq, self.art_raw, w, h, self.geo["cs"])).start()
+            threading.Thread(
+                target=self.asset_worker, daemon=True,
+                args=(self.asset_seq, self.art_raw, w, h, self.geo["cs"],
+                      SETTINGS["bg_darkness"], SETTINGS["bg_blur"])).start()
 
     def apply_assets(self, a):
         self.bg_photo = ImageTk.PhotoImage(a["bg"])
@@ -529,9 +892,13 @@ class App:
         g["f_album"] = F(max(13, int(h * .017)))
         g["f_time"] = F(max(11, int(h * .0145)))
         g["f_lyric"] = F(max(30, int(h * .052)), "bold")
+        g["f_trans"] = F(max(18, int(h * .029)))
         g["f_msg"] = F(max(20, int(h * .034)), "bold")
         g["f_pill"] = F(max(12, int(h * .0165)), "bold")
         g["f_hint"] = F(max(11, int(h * .0135)))
+        g["f_set_title"] = F(max(18, int(h * .026)), "bold")
+        g["f_set"] = F(max(14, int(h * .019)))
+        g["f_set_val"] = F(max(14, int(h * .019)), "bold")
 
         margin = int(w * .055)
         ctl_r = max(22, int(h * .032))
@@ -572,7 +939,8 @@ class App:
         self.geo = g
         self.layout_lines()
         if self.lines:
-            self.target_scroll = self.center_of(max(0, self.current)) if self.auto_follow else self.target_scroll
+            self.target_scroll = (self.center_of(max(0, self.current))
+                                  if self.auto_follow else self.target_scroll)
             self.scroll = self.target_scroll
         self.place_cover()
         self.static_dirty = True
@@ -582,18 +950,249 @@ class App:
         f = g["f_lyric"]
         lh = f.metrics("linespace")
         gap = int(lh * .55)
+        ft = g["f_trans"]
+        tlh = ft.metrics("linespace")
+        tgap = int(lh * .12)
         self.line_rows, self.line_y, self.line_h = [], [], []
+        self.line_trows, self.line_oh = [], []
         y = 0
-        for _, txt in self.lines:
+        show_trans = bool(SETTINGS["show_translation"])
+        for _, txt, tr in self.lines:
             rows = wrap(txt or "♪", f, g["lw"])
+            oh = len(rows) * lh
+            trows, th = "", 0
+            if show_trans and tr:
+                tr_rows = wrap(tr, ft, g["lw"])
+                trows, th = "\n".join(tr_rows), len(tr_rows) * tlh + tgap
             self.line_rows.append("\n".join(rows))
+            self.line_trows.append(trows)
+            self.line_oh.append(oh)
             self.line_y.append(y)
-            self.line_h.append(len(rows) * lh)
-            y += len(rows) * lh + gap
-        g["lh"], g["lgap"] = lh, gap
+            self.line_h.append(oh + th)
+            y += oh + th + gap
+        g["lh"], g["lgap"], g["tgap"] = lh, gap, tgap
 
     def center_of(self, i):
         return self.line_y[i] + self.line_h[i] / 2
+
+    # ------------------------------------------------------------ settings UI
+    def toggle_settings(self):
+        self.settings_open = not self.settings_open
+        if self.settings_open:
+            self.settings_sel = 0
+
+    def settings_layout(self):
+        g = self.geo
+        if not g:
+            return None
+        W, H = g["w"], g["h"]
+        n = len(SETTINGS_ROWS)
+        # Row height shrinks to fit if the screen is short.
+        min_row = 26
+        row_h = min(50, max(min_row, int(H * .046)))
+        top_pad, title_h = 40, 52
+        btns_h, btns_gap = 42, 12
+        info_h = 30
+        bottom_pad = 22
+        ph = top_pad + title_h + row_h * n + btns_gap + btns_h + info_h + bottom_pad
+        if ph > H - 60:
+            ph = H - 60
+            avail = ph - (top_pad + title_h + btns_gap + btns_h + info_h + bottom_pad)
+            row_h = max(min_row, avail // n)
+        pw = min(660, W - 80)
+        px0 = (W - pw) // 2
+        py0 = (H - ph) // 2
+
+        rows = []
+        for i, spec in enumerate(SETTINGS_ROWS):
+            ry = py0 + top_pad + title_h + i * row_h
+            rows.append({
+                "key": spec[0], "spec": spec,
+                "y": ry, "h": row_h, "cy": ry + row_h // 2,
+                "label_x": px0 + 32,
+                "ctrl_x0": px0 + pw - 260,
+                "ctrl_x1": px0 + pw - 32,
+            })
+        by0 = py0 + ph - bottom_pad - info_h - btns_h
+        by1 = by0 + btns_h
+        bw = 200
+        b_reset = (px0 + 24, by0, px0 + 24 + bw, by1)
+        b_clear = (b_reset[2] + 12, by0, b_reset[2] + 12 + bw, by1)
+        return {"px0": px0, "py0": py0, "pw": pw, "ph": ph,
+                "row_h": row_h, "rows": rows,
+                "title_y": py0 + top_pad + 22,
+                "reset": b_reset, "clear": b_clear,
+                "info_y": py0 + ph - 12}
+
+    def _tri(self, cx, cy, size, direction, color):
+        if direction == "left":
+            pts = [cx + size * .55, cy - size, cx + size * .55, cy + size, cx - size * .55, cy]
+        else:
+            pts = [cx - size * .55, cy - size, cx - size * .55, cy + size, cx + size * .55, cy]
+        self.canvas.create_polygon(pts, fill=color, outline="", tags="dyn")
+
+    def draw_settings(self):
+        if not self.settings_open or not self.geo:
+            return
+        c, g = self.canvas, self.geo
+        W, H = g["w"], g["h"]
+        lay = self.settings_layout()
+        if not lay:
+            return
+        self.settings_lay = lay
+        c.create_rectangle(0, 0, W, H, fill="#000000", outline="",
+                           tags="dyn", stipple="gray50")
+        px0, py0, pw, ph = lay["px0"], lay["py0"], lay["pw"], lay["ph"]
+        self.rrect(px0, py0, px0 + pw, py0 + ph, 18,
+                   fill="#141420", outline="#2c2c3a", tags="dyn")
+        c.create_text(px0 + 32, lay["title_y"], text="Settings", anchor="w",
+                      font=g["f_set_title"], fill="#ffffff", tags="dyn")
+
+        for i, row in enumerate(lay["rows"]):
+            spec = row["spec"]
+            key, label, kind = spec[0], spec[1], spec[2]
+            sel = (i == self.settings_sel)
+            if sel:
+                self.rrect(px0 + 14, row["y"] - 4, px0 + pw - 14, row["y"] + row["h"] - 4, 10,
+                           fill="#1f1f2d", outline="", tags="dyn")
+            c.create_text(row["label_x"], row["cy"], text=label, anchor="w",
+                          font=g["f_set"],
+                          fill="#ffffff" if sel else "#c0c0cc", tags="dyn")
+            val = SETTINGS[key]
+            cx0, cx1, cy = row["ctrl_x0"], row["ctrl_x1"], row["cy"]
+            if kind == "toggle":
+                tw, th = 56, 28
+                tx = cx1 - tw
+                ty = cy - th / 2
+                on = bool(val)
+                bg = hexc(mix((30, 30, 44), self.accent, .85)) if on else "#2a2a36"
+                self.rrect(tx, ty, tx + tw, ty + th, th / 2, fill=bg, outline="", tags="dyn")
+                kx = tx + tw - th / 2 if on else tx + th / 2
+                c.create_oval(kx - th / 2 + 3, ty + 3, kx + th / 2 - 3, ty + th - 3,
+                              fill="#ffffff", outline="", tags="dyn")
+            elif kind == "choice":
+                opts = spec[3]
+                self._tri(cx0 + 14, cy, 8, "left", "#9a9aa8")
+                self._tri(cx1 - 14, cy, 8, "right", "#9a9aa8")
+                c.create_text((cx0 + cx1) / 2, cy, text=str(val),
+                              font=g["f_set_val"], fill="#ffffff", tags="dyn")
+            elif kind == "slider":
+                _, _, _, lo, hi, step, unit = spec
+                self._tri(cx0 + 14, cy, 8, "left", "#9a9aa8")
+                self._tri(cx1 - 14, cy, 8, "right", "#9a9aa8")
+                txt = f"{float(val):g}{unit}"
+                c.create_text((cx0 + cx1) / 2, cy, text=txt,
+                              font=g["f_set_val"], fill="#ffffff", tags="dyn")
+                tx0, tx1 = cx0 + 40, cx1 - 40
+                c.create_line(tx0, cy + 16, tx1, cy + 16, width=3, capstyle="round",
+                              fill="#2a2a36", tags="dyn")
+                frac = (float(val) - lo) / max(1e-6, hi - lo)
+                xf = tx0 + (tx1 - tx0) * max(0.0, min(1.0, frac))
+                c.create_line(tx0, cy + 16, max(tx0 + .1, xf), cy + 16, width=3,
+                              capstyle="round", fill=hexc(self.accent), tags="dyn")
+
+        # buttons
+        hov = self.settings_button_hover()
+        for name, box, label in (("reset", lay["reset"], "Reset to defaults"),
+                                 ("clear", lay["clear"], f"Clear cache ({CACHE.size()})")):
+            x0, y0, x1, y1 = box
+            fill = "#3a3a48" if hov == name else "#2a2a36"
+            self.rrect(x0, y0, x1, y1, 8, fill=fill, outline="", tags="dyn")
+            c.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=label,
+                          font=g["f_set"], fill="#ddddE8", tags="dyn")
+
+        # info line: show current storage paths (short) or a toast
+        info_y = lay["info_y"]
+        cx = px0 + pw / 2
+        if self.settings_toast and time.perf_counter() < self.settings_toast_until:
+            c.create_text(cx, info_y, text=self.settings_toast,
+                          font=g["f_hint"], fill=hexc(mix(self.accent, WHITE, .5)), tags="dyn")
+        else:
+            loc = SETTINGS["storage_location"]
+            info = f"{loc}: {shorten_path(CACHE.path, 60)}"
+            c.create_text(cx, info_y, text=info,
+                          font=g["f_hint"], fill="#7a7a88", tags="dyn")
+
+    def settings_button_hover(self):
+        if not self.settings_lay:
+            return None
+        for name in ("reset", "clear"):
+            x0, y0, x1, y1 = self.settings_lay[name]
+            if x0 <= self.mx <= x1 and y0 <= self.my <= y1:
+                return name
+        return None
+
+    def settings_click(self, x, y):
+        lay = self.settings_lay or self.settings_layout()
+        if not lay:
+            return
+        if not (lay["px0"] <= x <= lay["px0"] + lay["pw"]
+                and lay["py0"] <= y <= lay["py0"] + lay["ph"]):
+            self.settings_open = False
+            return
+        hov = self.settings_button_hover()
+        if hov == "reset":
+            SETTINGS.reset()
+            # storage_location may have changed to "script"; migrate paths
+            migrate_storage(SETTINGS["storage_location"])
+            self.settings_apply_all()
+            self.flash_toast("Settings reset to defaults")
+            return
+        if hov == "clear":
+            n = CACHE.size()
+            CACHE.clear()
+            self.flash_toast(f"Cleared {n} cached tracks")
+            return
+        for i, row in enumerate(lay["rows"]):
+            if row["y"] - 4 <= y <= row["y"] + row["h"] - 4:
+                self.settings_sel = i
+                spec = row["spec"]
+                key, kind = spec[0], spec[2]
+                if kind == "toggle":
+                    self.change_setting(key, spec, +1)
+                else:
+                    mid = (row["ctrl_x0"] + row["ctrl_x1"]) / 2
+                    self.change_setting(key, spec, -1 if x < mid else +1)
+                return
+
+    def flash_toast(self, msg, secs=2.0):
+        self.settings_toast = msg
+        self.settings_toast_until = time.perf_counter() + secs
+
+    def settings_apply_all(self):
+        self.geo = None
+        self.built_sig = None
+        self.static_dirty = True
+
+    def change_setting(self, key, spec, direction):
+        kind = spec[2]
+        if kind == "toggle":
+            SETTINGS[key] = not bool(SETTINGS[key])
+        elif kind == "slider":
+            _, _, _, lo, hi, step, _ = spec
+            v = float(SETTINGS[key]) + direction * step
+            SETTINGS[key] = round(max(lo, min(hi, v)), 4)
+        elif kind == "choice":
+            opts = spec[3]
+            cur = SETTINGS[key] if SETTINGS[key] in opts else opts[0]
+            i = (opts.index(cur) + direction) % len(opts)
+            SETTINGS[key] = opts[i]
+        self.apply_setting(key)
+
+    def apply_setting(self, key):
+        if key == "storage_location":
+            migrate_storage(SETTINGS["storage_location"])
+            self.flash_toast(f"Data moved to {SETTINGS['storage_location']}")
+        if key == "font_scale":
+            self.geo = None
+        if key in ("bg_darkness", "bg_blur"):
+            self.built_sig = None
+            self.immediate = True
+        if key == "show_translation" and self.geo and self.lines:
+            self.layout_lines()
+        if key == "lyric_source":
+            self.refetch_lyrics()
+        self.static_dirty = True
 
     # ---------------------------------------------------------- interaction
     def hit_at(self, x, y):
@@ -620,6 +1219,9 @@ class App:
         return None
 
     def update_hover(self):
+        if self.settings_open:
+            self.hover_hit, self.hover_line = None, -1
+            return
         hit = self.hit_at(self.mx, self.my)
         self.hover_hit = hit
         self.hover_line = hit[1] if hit and hit[0] == "line" else -1
@@ -638,6 +1240,9 @@ class App:
     def on_press(self, e):
         self.mx, self.my = e.x, e.y
         self.last_move = time.perf_counter()
+        if self.settings_open:
+            self.settings_click(e.x, e.y)
+            return
         self.update_hover()
         hit = self.hover_hit
         if not hit:
@@ -674,16 +1279,47 @@ class App:
             if self.duration > 0:
                 self.seek_to(self.drag_frac * self.duration)
 
-    def wheel(self, direction):
+    def on_wheel(self, delta):
+        if self.settings_open:
+            return
         if not self.lines or not self.geo:
             return
+        step_dir = -1 if delta > 0 else 1
         self.auto_follow = False
         step = self.geo["lh"] * 2
         lo, hi = self.center_of(0), self.center_of(len(self.lines) - 1)
-        self.target_scroll = max(lo, min(hi, self.target_scroll + direction * step))
+        self.target_scroll = max(lo, min(hi, self.target_scroll + step_dir * step))
 
     def follow_now(self):
         self.auto_follow = True
+
+    def on_key(self, key):
+        if self.settings_open:
+            if key == "<Escape>":
+                self.settings_open = False
+            elif key == "<Up>":
+                self.settings_sel = (self.settings_sel - 1) % len(SETTINGS_ROWS)
+            elif key == "<Down>":
+                self.settings_sel = (self.settings_sel + 1) % len(SETTINGS_ROWS)
+            elif key == "<Left>":
+                spec = SETTINGS_ROWS[self.settings_sel]
+                self.change_setting(spec[0], spec, -1)
+            elif key == "<Right>":
+                spec = SETTINGS_ROWS[self.settings_sel]
+                self.change_setting(spec[0], spec, +1)
+            elif key == "<space>":
+                spec = SETTINGS_ROWS[self.settings_sel]
+                if spec[2] == "toggle":
+                    self.change_setting(spec[0], spec, +1)
+            return
+        if key == "<space>":
+            self.playpause()
+        elif key == "<Left>":
+            self.skip(-10)
+        elif key == "<Right>":
+            self.skip(10)
+        elif key == "<Escape>":
+            self.exit_fullscreen()
 
     # -------------------------------------------------------------- drawing
     def rrect(self, x0, y0, x1, y1, r, **kw):
@@ -717,7 +1353,8 @@ class App:
                           font=g["f_album"], fill=hexc(mix(tint, WHITE, .45)), tags="static")
 
     def update_lyrics(self, pos, dt):
-        idx = bisect.bisect_right(self.times, pos + LYRIC_LEAD) - 1 if self.times else -1
+        lead = float(SETTINGS["lyric_lead"])
+        idx = bisect.bisect_right(self.times, pos + lead) - 1 if self.times else -1
         self.current = idx
         k = 1 - math.exp(-dt * 10)
         for i, f in enumerate(self.focus):
@@ -743,6 +1380,11 @@ class App:
             if msg:
                 c.create_text(lx, ay, text=msg, anchor="w", font=g["f_msg"],
                               fill=hexc(mix(tint, WHITE, .5)), tags="dyn")
+                if self.lyric_state == "none":
+                    c.create_text(lx, ay + g["f_msg"].metrics("linespace") * 1.3,
+                                  text="Press R to try again · S for settings",
+                                  anchor="w", font=g["f_hint"],
+                                  fill=hexc(mix(tint, WHITE, .3)), tags="dyn")
             return
         base = mix(tint, WHITE, .44)
         for i in range(len(self.lines)):
@@ -758,10 +1400,17 @@ class App:
             col = mix(tint, mix(base, WHITE, f), .12 + .88 * fade)
             c.create_text(lx, top, text=self.line_rows[i], anchor="nw", font=g["f_lyric"],
                           fill=hexc(col), justify="left", tags="dyn")
+            if self.line_trows[i]:
+                tcol = mix(tint, mix(tint, WHITE, .30 + .45 * f), .12 + .88 * fade)
+                c.create_text(lx, top + self.line_oh[i] + g["tgap"], text=self.line_trows[i],
+                              anchor="nw", font=g["f_trans"], fill=hexc(tcol),
+                              justify="left", tags="dyn")
 
     def draw_controls(self, pos):
         c, g, tint, ua = self.canvas, self.geo, self.tint, self.ui_alpha
         h = g["h"]
+        if not SETTINGS["show_controls"]:
+            ua = 0.0
         x0, x1, by = g["bar"]
         dur = self.duration
         frac = self.drag_frac if self.dragging else (pos / dur if dur > 0 else 0)
@@ -795,7 +1444,8 @@ class App:
                 if name == "play":
                     pr = r * (1.06 if hov == "play" else 1.0)
                     fillc = mix(tint, WHITE, ua)
-                    c.create_oval(cx - pr, cy - pr, cx + pr, cy + pr, fill=hexc(fillc), outline="", tags="dyn")
+                    c.create_oval(cx - pr, cy - pr, cx + pr, cy + pr, fill=hexc(fillc),
+                                  outline="", tags="dyn")
                     gc = hexc(mix(fillc, dark, ua))
                     u = r * .45
                     if self.playing:
@@ -816,30 +1466,40 @@ class App:
                     s = -1 if name == "back" else 1
                     a0, a1 = (-1.05, -.1) if s == -1 else (1.05, .1)
                     b0, b1 = (-.1, .85) if s == -1 else (.1, -.85)
-                    c.create_polygon(cx + a1 * u, cy - u * .75, cx + a1 * u, cy + u * .75, cx + a0 * u, cy,
-                                     fill=col, outline="", tags="dyn")
-                    c.create_polygon(cx + b1 * u, cy - u * .75, cx + b1 * u, cy + u * .75, cx + b0 * u, cy,
-                                     fill=col, outline="", tags="dyn")
-                    c.create_text(cx, cy + u * 1.9, text="10", font=g["f_time"], fill=col, tags="dyn")
+                    c.create_polygon(cx + a1 * u, cy - u * .75, cx + a1 * u, cy + u * .75,
+                                     cx + a0 * u, cy, fill=col, outline="", tags="dyn")
+                    c.create_polygon(cx + b1 * u, cy - u * .75, cx + b1 * u, cy + u * .75,
+                                     cx + b0 * u, cy, fill=col, outline="", tags="dyn")
+                    c.create_text(cx, cy + u * 1.9, text="10", font=g["f_time"],
+                                  fill=col, tags="dyn")
 
-        if not self.auto_follow and self.lines:
+        if not self.auto_follow and self.lines and not self.settings_open:
             x0p, y0p, x1p, y1p = g["pill"]
             hp = self.hover_hit and self.hover_hit[0] == "pill"
             self.rrect(x0p, y0p, x1p, y1p, (y1p - y0p) / 2, tags="dyn", outline="",
                        fill=hexc(mix(tint, self.accent, .75 if hp else .55)))
             c.create_text((x0p + x1p) / 2, (y0p + y1p) / 2, text=g["pill_txt"], font=g["f_pill"],
                           fill="#ffffff", tags="dyn")
-        if ua > .05:
+        if ua > .05 and SETTINGS["show_hint"] and not self.settings_open:
+            bits = []
+            if self.lyric_source:
+                bits.append(f"Lyrics: {self.lyric_source}")
+            bits.append("Scroll to browse")
+            bits.append("Click line to jump")
+            bits.append("S settings")
+            bits.append("R refetch")
+            bits.append("F11 fullscreen")
             c.create_text(g["lx"], g["h"] - int(g["h"] * .04),
-                          text="Scroll to browse   ·   Click a line to jump   ·   F11 fullscreen",
-                          anchor="sw", font=g["f_hint"], fill=hexc(mix(tint, WHITE, .33 * ua)),
-                          tags="dyn")
+                          text="   ·   ".join(bits),
+                          anchor="sw", font=g["f_hint"],
+                          fill=hexc(mix(tint, WHITE, .33 * ua)), tags="dyn")
 
     def update_cursor(self):
-        hit = self.hover_hit
-        if self.ui_alpha < .05 and self.fullscreen and not self.dragging:
+        if self.settings_open:
+            want = "hand2" if self.settings_button_hover() else "arrow"
+        elif self.ui_alpha < .05 and self.fullscreen and not self.dragging:
             want = "none"
-        elif hit:
+        elif self.hover_hit:
             want = "hand2"
         else:
             want = "arrow"
@@ -877,7 +1537,8 @@ class App:
         self.manage_assets(now)
 
         idle = now - self.last_move
-        show = idle < UI_HIDE_AFTER or not self.playing or self.dragging
+        show = (idle < float(SETTINGS["ui_hide_after"])
+                or not self.playing or self.dragging or self.settings_open)
         tgt = 1.0 if show else 0.0
         self.ui_alpha += (tgt - self.ui_alpha) * (1 - math.exp(-dt * (12 if tgt > self.ui_alpha else 2.2)))
 
@@ -887,6 +1548,7 @@ class App:
         self.canvas.delete("dyn")
         self.draw_lyrics()
         self.draw_controls(pos)
+        self.draw_settings()
         self.update_cursor()
 
 
