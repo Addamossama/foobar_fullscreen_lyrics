@@ -31,7 +31,6 @@ Install the release .zip,extract it ,then run the `.exe`.
 
 * Python 3.10+
 * Pillow >= 10.0
-* foobar2000 with the Beefweb component, listening on `http://127.0.0.1:8880` (the default).
 * Tkinter (bundled with Python on Windows/macOS; `python3-tk` on Linux).
 
 Install the release .pyw  
