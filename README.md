@@ -29,7 +29,7 @@ Install the release, then run the `.exe`.
 - **foobar2000** with the [Beefweb](https://github.com/hyperblast/beefweb) component, listening on `http://127.0.0.1:8880` (the default).
 - Tkinter (bundled with Python on Windows/macOS; `python3-tk` on Linux).
 - 
-##keyboard controls
+## keyboard controls
 
 P                open/close playlist panel
 Enter            play selected item (panel)
