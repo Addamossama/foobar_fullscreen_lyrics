@@ -32,3 +32,4 @@ Just double-click it.
 ### 3. As a component
 
 Install the component in foobar2000.
+click view > Foobar Fullscreen Lyrics
