@@ -30,6 +30,7 @@ Install the release, then run the `.exe`.
 - Tkinter (bundled with Python on Windows/macOS; `python3-tk` on Linux).
 - 
 ##keyboard controls
+
 P                open/close playlist panel
 Enter            play selected item (panel)
 Delete           remove selected item (panel)
