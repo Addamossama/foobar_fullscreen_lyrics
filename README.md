@@ -4,16 +4,8 @@ A fullscreen lyrics app for **foobar2000 x86**, made to provide a fullscreen mus
 
 ## Requirements
 
-* Python 3.10+
-* Pillow
 * foobar2000 x86
 * Beefweb
-
-### Install Pillow
-
-```bash
-py -m pip install Pillow
-```
 
 ### Beefweb
 
