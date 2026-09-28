@@ -13,11 +13,11 @@ Default address:
 
 ## Install
 
-### 1. Via release
+### 1. Via release(independent app)
 
 Install the release, then run the `.exe`.
 
-### 2. Via the `.pyw` file
+### 2. Via the `.pyw` file(independent script)
 
 #### Requirements
 
@@ -27,6 +27,7 @@ Install the release, then run the `.exe`.
 - Tkinter (bundled with Python on Windows/macOS; `python3-tk` on Linux).
 
 Just double click it
+### 3.as a component
 
 ## keyboard controls
 
