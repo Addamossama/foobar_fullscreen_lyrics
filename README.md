@@ -6,9 +6,6 @@ A fullscreen lyrics app for **foobar2000 x86**, made to provide a fullscreen mus
 
 - **foobar2000** with the [Beefweb](https://github.com/hyperblast/beefweb) component, listening on `http://127.0.0.1:8880` (the default).
 
-### Beefweb
-
-The app uses Beefweb to communicate with foobar2000.
 
 Default address:
 
