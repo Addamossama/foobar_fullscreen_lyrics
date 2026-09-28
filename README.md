@@ -15,9 +15,13 @@ http://127.0.0.1:8880
 ```
 
 ##install
+
 ###1-via release
+
 install release then run .exe
+
 ###2-via py file
+
 ### Requirements
 
 - Python **3.10+**
