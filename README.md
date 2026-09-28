@@ -31,15 +31,15 @@ Install the release, then run the `.exe`.
 - 
 ## keyboard controls
 
--P                open/close playlist panel
--Enter            play selected item (panel)
--Delete           remove selected item (panel)
--Ctrl+Up/Down     move selected item (panel)
--Up/Down          move selection (panel / settings)
--Left/Right       switch playlist (panel) / change setting (settings panel)
--R                refetch lyrics — or refresh playlists when panel is open
--S                settings panel
--V                toggle translation
--F                follow current line
--F11 / Esc        fullscreen toggle / leave
--Space            play / pause
+- `P` — open/close playlist panel
+- `Enter` — play selected item (panel)
+- `Delete` — remove selected item (panel)
+- `Ctrl+Up/Down` — move selected item (panel)
+- `Up/Down` — move selection (panel / settings)
+- `Left/Right` — switch playlist (panel) / change setting (settings panel)
+- `R` — refetch lyrics — or refresh playlists when panel is open
+- `S` — settings panel
+- `V` — toggle translation
+- `F` — follow current line
+- `F11 / Esc` — fullscreen toggle / leave
+- `Space` — play / pause
