@@ -28,6 +28,7 @@ Install the release, then run the `.exe`.
 - [Pillow](https://python-pillow.org) `>= 10.0`
 - **foobar2000** with the [Beefweb](https://github.com/hyperblast/beefweb) component, listening on `http://127.0.0.1:8880` (the default).
 - Tkinter (bundled with Python on Windows/macOS; `python3-tk` on Linux).
+- 
 ##keyboard controls
 P                open/close playlist panel
 Enter            play selected item (panel)
