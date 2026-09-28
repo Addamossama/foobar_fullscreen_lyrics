@@ -21,11 +21,11 @@ http://127.0.0.1:8880
 
 ## Install
 
-### 1. Via release (independent app)
+### 1.independent exe app
 
-Install the release, then run the `.exe`.
+Install the release .zip,extract it ,then run the `.exe`.
 
-### 2. Via the `.pyw` file (independent script)
+### 2.independent script
 
 **Requirements:**
 
@@ -34,9 +34,10 @@ Install the release, then run the `.exe`.
 * foobar2000 with the Beefweb component, listening on `http://127.0.0.1:8880` (the default).
 * Tkinter (bundled with Python on Windows/macOS; `python3-tk` on Linux).
 
+Install the release .pyw  
 Just double-click it.
 
 ### 3. As a component
-
+Install the release .fb2k-component  
 Install the component in foobar2000.
 click view > Foobar Fullscreen Lyrics
