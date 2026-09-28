@@ -4,7 +4,7 @@ A fullscreen lyrics app for foobar2000 x86, made to provide a fullscreen music/l
 
 ## General requirements
 
-* foobar2000 with the Beefweb component
+* foobar2000 32-bit with the Beefweb component  
 https://www.foobar2000.org/components/view/foo_beefweb
 
 **Default address:**
