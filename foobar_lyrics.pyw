@@ -16,7 +16,7 @@ New in v9
 Settings and the lyric cache live next to the script by default (switchable
 to %APPDATA% in Settings -> Data location).
 """
-import bisect, colorsys, io, json, math, os, queue, re, sys, threading, time
+import bisect, colorsys, io, json, math, os, queue, random, re, sys, threading, time
 import urllib.error, urllib.parse, urllib.request
 import tkinter as tk
 import tkinter.font as tkfont
@@ -28,6 +28,10 @@ from PIL import (Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageO
 try:  # crisp text on Windows high-DPI screens
     import ctypes
     ctypes.windll.shcore.SetProcessDpiAwareness(1)
+except Exception:
+    pass
+try:  # own taskbar identity so the .ico shows instead of pythonw's
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("FoobarLyrics.App")
 except Exception:
     pass
 
@@ -67,12 +71,122 @@ SORT_OPTIONS = [
 
 # ----------------------------------------------------------- storage paths
 def _script_dir() -> Path:
-    if getattr(sys, "frozen", False):     # PyInstaller / frozen exe
-        return Path(sys.executable).resolve().parent
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS)
     return Path(__file__).resolve().parent
 
 
 SCRIPT_DIR = _script_dir()
+
+
+def find_icon():
+    for n in ("logo.ico", "icon.ico", "foobar_lyrics.ico", "app.ico"):
+        if (SCRIPT_DIR / n).is_file():
+            return SCRIPT_DIR / n
+    return next(iter(sorted(SCRIPT_DIR.glob("*.ico"))), None)
+
+
+ICON_PATH = find_icon()
+
+
+def set_app_icon(root):
+    if not ICON_PATH:
+        return
+
+    try:
+        root.iconbitmap(str(ICON_PATH))
+    except Exception:
+        try:
+            root._icon = ImageTk.PhotoImage(
+                Image.open(ICON_PATH).convert("RGBA")
+            )
+            root.iconphoto(True, root._icon)
+        except Exception:
+            pass
+
+
+FB_CLASSES = ("{97E27FAA-C0B3-4b8e-A693-ED7881E99FC1}", "{E7076D1C-A7BF-4f39-B771-BCBE88F2A2A8}")
+
+
+class FoobarTray:
+    """Hides the minimized foobar2000 window and parks a tray icon that restores it."""
+
+    def __init__(self, on_quit, on_show_app, on_missing):
+        self.hwnd, self.icon = None, None
+        self.on_quit, self.on_show_app, self.on_missing = on_quit, on_show_app, on_missing
+        if IS_WIN:
+            from ctypes import wintypes as wt
+            u = self.u = ctypes.windll.user32
+            u.GetWindow.argtypes = [wt.HWND, wt.UINT]
+            u.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+            for f in (u.IsIconic, u.IsWindow, u.IsWindowVisible, u.SetForegroundWindow):
+                f.argtypes = [wt.HWND]
+            u.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
+            self.CB = ctypes.WINFUNCTYPE(ctypes.c_int, wt.HWND, wt.LPARAM)
+
+    def find(self):
+        u, found, buf = self.u, [], ctypes.create_unicode_buffer(256)
+
+        def cb(h, _):
+            u.GetClassNameW(h, buf, 256)
+            if buf.value in FB_CLASSES and not u.GetWindow(h, 4):
+                found.append(h)
+                return 0
+            return 1
+        u.EnumWindows(self.CB(cb), 0)
+        return found[0] if found else None
+
+    def poll(self, enabled):
+        if not IS_WIN:
+            return
+        u = self.u
+        if self.hwnd:
+            if not enabled or not u.IsWindow(self.hwnd):
+                self.restore(show=enabled)
+            return
+        if not enabled:
+            return
+        h = self.find()
+        if h and u.IsIconic(h) and u.IsWindowVisible(h):
+            u.ShowWindow(h, 0)
+            self.hwnd = h
+            self.show_icon()
+
+    def restore(self, *_, show=True):
+        h, self.hwnd = self.hwnd, None
+        if h and show and self.u.IsWindow(h):
+            self.u.ShowWindow(h, 9)
+            self.u.SetForegroundWindow(h)
+        elif h and self.u.IsWindow(h):
+            self.u.ShowWindow(h, 9)
+        if self.icon:
+            try:
+                self.icon.stop()
+            except Exception:
+                pass
+            self.icon = None
+
+    def image(self):
+        try:
+            return Image.open(ICON_PATH).convert("RGBA")
+        except Exception:
+            im = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            ImageDraw.Draw(im).ellipse((4, 4, 60, 60), fill=DEFAULT_ACCENT + (255,))
+            return im
+
+    def show_icon(self):
+        try:
+            import pystray
+            menu = pystray.Menu(
+                pystray.MenuItem("Show foobar2000", self.restore, default=True),
+                pystray.MenuItem("Show Foobar Lyrics", lambda *_: self.on_show_app()),
+                pystray.MenuItem("Quit Foobar Lyrics", lambda *_: self.on_quit()))
+            self.icon = pystray.Icon("FoobarLyrics", self.image(), "foobar2000", menu)
+            self.icon.run_detached()
+        except Exception:
+            self.icon = None
+            self.restore()
+            self.on_missing()
 APPDATA_DIR = Path(os.getenv("APPDATA") or Path.home()) / "FoobarLyrics"
 
 
@@ -105,6 +219,8 @@ DEFAULT_SETTINGS = {
     "volume_step": 5.0,          # % of the volume slider per key press
     "show_up_next": True,        # "Up next" card near the end of a track
     "confirm_destructive": True,  # ask before clearing / deleting playlists
+    "foobar_to_tray": False,     # minimizing foobar2000 sends it to the tray
+    "queue_repeat": False,       # played queue tracks go back to the end of the queue
     "show_controls": True,
     "show_hint": True,
 }
@@ -281,6 +397,7 @@ SETTINGS_ROWS = [
     ("show_up_next",        "Show “Up next”",       "toggle"),
     ("show_hint",           "Show hint bar",        "toggle"),
     ("confirm_destructive", "Confirm deletes",      "toggle"),
+    ("foobar_to_tray",      "foobar2000 minimize to tray", "toggle"),
     ("storage_location",    "Data location",        "choice", ["script", "appdata"]),
 ]
 
@@ -812,11 +929,12 @@ SHORTCUTS = {
         (["P"], "Open / close playlists"),
         (["Tab"], "Next playlist (Shift: previous)"),
         (["↑", "↓"], "Move cursor (Shift extends)"),
-        (["Enter"], "Play (or double-click)"),
+        (["Enter"], "Play · several selected: add to top of queue"),
         (["Del"], "Remove selected tracks"),
         (["Alt", P("+"), "↑", "↓"], "Reorder (or drag)"),
         (["Ctrl", P("+"), "A"], "Select all"),
         (["Q"], "Add to / remove from queue"),
+        (["Shift", P("+"), "Q"], "Queue menu (shuffle / repeat / clear)"),
         (["J"], "Jump to playing track"),
         (["/"], "Filter tracks"),
         (["Ctrl", P("+"), "N"], "New playlist"),
@@ -842,6 +960,7 @@ class App:
     def __init__(self, root):
         self.root = root
         root.title("Foobar Lyrics")
+        set_app_icon(root)
         root.configure(bg="#050508")
         root.minsize(900, 520)
         self.fullscreen = True
@@ -961,8 +1080,13 @@ class App:
         root.bind("<Key>", self.on_keypress)
         root.protocol("WM_DELETE_WINDOW", self.close)
 
+        self.tray = FoobarTray(lambda: self.events.put(("quit",)),
+                               lambda: self.events.put(("show_app",)),
+                               lambda: self.events.put(("tray_missing",)))
+        self._sub_parent = None
         threading.Thread(target=self.poll_loop, daemon=True).start()
         threading.Thread(target=self.edit_loop, daemon=True).start()
+        threading.Thread(target=self.tray_loop, daemon=True).start()
         root.after(30, self.tick)
         root.after(200, lambda: (root.focus_force(), c.focus_set()))
 
@@ -992,8 +1116,20 @@ class App:
             r = self._mw[k] = font.measure(text)
         return r
 
+    def tray_loop(self):
+        while self.alive:
+            try:
+                self.tray.poll(bool(SETTINGS["foobar_to_tray"]))
+            except Exception:
+                pass
+            time.sleep(0.4)
+
     def close(self):
         self.alive = False
+        try:
+            self.tray.restore()
+        except Exception:
+            pass
         try:
             SETTINGS.save()
             CACHE.save(force=True)
@@ -1298,15 +1434,22 @@ class App:
         self.vol = vol
         self.perm_pl = r["perm_pl"]
 
-        pl_before = self.play_pl_id
+        pl_before, idx_before = self.play_pl_id, self.play_idx
         self.play_pl_id, self.play_idx = r["pl_id"], r["idx"]
         if pl_before != self.play_pl_id:
             self.pl_tab_reveal = True
         self.sync_playlists(r["playlists"], now)
         qi = r["queue"] or []
+        prev = [(x.get("playlistId"), x.get("itemIndex")) for x in self.queue_items]
         self.queue_items = qi
         self.queue_pos = {(x.get("playlistId"), x.get("itemIndex")): n + 1
                           for n, x in enumerate(qi)}
+        cur = (r["pl_id"], r["idx"])
+        if (SETTINGS["queue_repeat"] and prev and cur[0] is not None
+                and cur != (pl_before, idx_before) and prev[0] == cur
+                and list(self.queue_pos) == prev[1:]):
+            self.serial(lambda c=cur: post_json(BEEFWEB + "/playqueue/add",
+                                                {"plref": c[0], "itemIndex": c[1]}))
 
         key = (r["a"], r["t"], r["al"])
         if key != self.track_key and (key[0] or key[1]):
@@ -1414,6 +1557,17 @@ class App:
                 except Exception:
                     import traceback
                     traceback.print_exc()
+            elif kind == "quit":
+                self.close()
+                return
+            elif kind == "show_app":
+                self.root.deiconify()
+                self.root.lift()
+                self.root.focus_force()
+            elif kind == "tray_missing":
+                SETTINGS["foobar_to_tray"] = False
+                self.static_dirty = True
+                self.toast("Tray needs:  pip install pystray", 5)
             elif kind == "job_done":
                 self.jobs_pending = max(0, self.jobs_pending - 1)
             elif kind == "resync":
@@ -1597,10 +1751,11 @@ class App:
         ux_rep = ux_shuf + util_r * 2.9
         ux_list = px + cs - util_r
         ux_help = ux_list - util_r * 2.9
+        ux_queue = ux_help - util_r * 2.9
         ux_vol = ux_rep + util_r * 3.1
-        vx0, vx1 = ux_vol + util_r * 1.5, ux_help - util_r * 2.3
+        vx0, vx1 = ux_vol + util_r * 1.5, ux_queue - util_r * 2.3
         util = [("shuffle", ux_shuf), ("repeat", ux_rep), ("mute", ux_vol),
-                ("help", ux_help), ("list", ux_list)]
+                ("queue", ux_queue), ("help", ux_help), ("list", ux_list)]
 
         lx = half + int(w * .02)
         pill_txt = "Follow lyrics"
@@ -2027,6 +2182,85 @@ class App:
         self.serial(lambda: post_json(BEEFWEB + "/playqueue/clear"))
         self.toast("Queue cleared")
 
+    def pl_queue_top(self):
+        sel, pid = self.pl_selected(), self.pl_view_id
+        if not sel or not pid or not self.connected:
+            return
+        sel = sel[:200]
+
+        def job():
+            for k, i in enumerate(sel):
+                if (pid, i) in self.queue_pos:
+                    post_json(BEEFWEB + "/playqueue/remove", {"plref": pid, "itemIndex": i})
+                post_json(BEEFWEB + "/playqueue/add",
+                          {"plref": pid, "itemIndex": i, "queueIndex": k})
+        self.serial(job)
+        self.toast(f"Added {plural(len(sel), 'track')} to top of queue")
+
+    def queue_shuffle(self):
+        keys = [(x.get("playlistId"), x.get("itemIndex")) for x in self.queue_items]
+        if len(keys) < 2:
+            return
+        random.shuffle(keys)
+
+        def job():
+            post_json(BEEFWEB + "/playqueue/clear")
+            for pid, i in keys:
+                post_json(BEEFWEB + "/playqueue/add", {"plref": pid, "itemIndex": i})
+        self.serial(job)
+        self.toast("Queue shuffled")
+
+    def toggle_queue_repeat(self):
+        SETTINGS["queue_repeat"] = v = not SETTINGS["queue_repeat"]
+        self.toast("Queue repeat on" if v else "Queue repeat off")
+
+    def queue_remove(self, it):
+        self.serial(lambda: post_json(BEEFWEB + "/playqueue/remove",
+                                      {"plref": it.get("playlistId"),
+                                       "itemIndex": it.get("itemIndex")}))
+
+    def menu_queue(self, x=None, y=None):
+        if x is None:
+            g = self.geo
+            x, y = (g["util_pos"]["queue"][0], g["util_pos"]["queue"][1] - 10) if g else (100, 100)
+
+        def live():
+            qi = self.queue_items
+            items = [
+                {"label": "Shuffle queue", "fn": self.queue_shuffle, "keep": True,
+                 "enabled": len(qi) > 1},
+                {"label": "Repeat queue", "checked": bool(SETTINGS["queue_repeat"]),
+                 "keep": True, "fn": self.toggle_queue_repeat},
+                {"label": "Clear queue", "fn": self.clear_queue, "enabled": bool(qi),
+                 "danger": True},
+                None]
+            for n, it in enumerate(qi[:20]):
+                c = it.get("columns") or []
+                t = " – ".join(str(v) for v in (c[1:2] + c[:1]) if v)[:56] or "Track"
+                items.append({"label": f"{n + 1}. {t}", "hint": "✕", "keep": True,
+                              "fn": lambda it=it: self.queue_remove(it)})
+            if len(qi) > 20:
+                items.append({"label": f"+ {len(qi) - 20} more", "enabled": False})
+            if not qi:
+                items.append({"label": "Queue is empty", "enabled": False})
+            return f"Queue · {len(qi)}", items
+        self.open_menu(x, y, [], up=True, live=live)
+
+    def pl_copy_new(self):
+        sel, src = self.pl_selected(), self.pl_view_id
+        if not sel or not src or not self._can_edit():
+            return
+
+        def ok(title):
+            def created(res):
+                if isinstance(res, dict) and res.get("id"):
+                    self.pl_edit(f"/playlists/{q(src)}/{q(res['id'])}/items/copy",
+                                 {"items": sel}, refresh=False)
+                    self.toast(f"Copied {plural(len(sel), 'track')} to “{title}”")
+            self.pl_edit("/playlists/add", {"title": title}, ok=created, refresh=False)
+        self.prompt(f"New playlist for {plural(len(sel), 'track')}", "New Playlist", ok,
+                    ok_label="Create")
+
     def pl_sort(self, expr=None, label="", random_=False):
         if not self.pl_view_id:
             return
@@ -2184,8 +2418,8 @@ class App:
             {"label": "Select in foobar2000", "fn": lambda: self.pl_activate(pid), "enabled": bool(pl)},
             {"label": "Refresh", "hint": "F5", "fn": self.pl_request_items},
         ]
-        if self.queue_items:
-            items += [{"label": f"Clear queue ({len(self.queue_items)})", "fn": self.clear_queue}]
+        items += [{"label": f"Queue ({len(self.queue_items)})", "sub": True,
+                   "fn": lambda: self.menu_queue(x, y)}]
         items += [
             None,
             {"label": "Clear playlist…", "fn": lambda: self.pl_clear(pid), "danger": True,
@@ -2216,11 +2450,14 @@ class App:
             {"label": "Play", "hint": "Enter", "fn": lambda: self.pl_play(sel[0])},
             {"label": ("Remove from queue" if all_q else "Add to queue"), "hint": "Q",
              "fn": self.pl_toggle_queue},
+            {"label": "Add to top of queue", "hint": "Enter" if n > 1 else "",
+             "fn": self.pl_queue_top},
             None,
             {"label": "Move to top", "fn": lambda: self.pl_move_to(sel, 0)},
             {"label": "Move to bottom", "fn": lambda: self.pl_move_to(sel, len(self.pl_items))},
-            {"label": "Copy to playlist", "sub": True, "enabled": bool(others),
+            {"label": "Copy to playlist", "sub": True,
              "fn": lambda: self.open_menu(x, y, [
+                 {"label": "New playlist…", "fn": self.pl_copy_new}, None] + [
                  {"label": p.get("title", "?"), "fn": (lambda d=p.get("id"): self.pl_copy_to(d))}
                  for p in others[:30]], title=f"Copy {plural(n, 'track')} to")},
             {"label": "Keep only selected", "fn": self.pl_crop_selected,
@@ -2247,6 +2484,8 @@ class App:
              "fn": self.toggle_shuffle},
             {"label": "Playback order", "sub": True, "hint": "O",
              "fn": lambda: self.order_menu(x, y)},
+            {"label": f"Queue ({len(self.queue_items)})", "sub": True, "hint": "⇧Q",
+             "fn": lambda: self.menu_queue(x, y)},
             None,
             {"label": "Settings", "hint": "S", "fn": self.toggle_settings},
             {"label": "Keyboard shortcuts", "hint": "?", "fn": self.toggle_help},
@@ -2258,12 +2497,22 @@ class App:
         self.open_menu(x, y, items)
 
     # ============================================================== MENUS
-    def open_menu(self, x, y, items, title=None, up=False):
-        self.menu = {"x": x, "y": y, "items": items, "title": title, "sel": -1, "up": up,
-                     "t0": time.perf_counter()}
+    def open_menu(self, x, y, items, title=None, up=False, live=None):
+        par, self._sub_parent = self._sub_parent, None
+        m = {"x": x, "y": y, "items": items, "title": title, "sel": -1, "up": up,
+             "t0": time.perf_counter(), "parent": par[0] if par else None, "live": live}
+        if live:
+            m["title"], m["items"] = live()
+        if par:
+            pm, i = par
+            pm["sub_row"] = i
+            row = next((r for r in (pm.get("lay") or {}).get("rows", []) if r[0] == i), None)
+            if row:
+                m["anchor"] = (pm["lay"]["x0"], pm["lay"]["x1"], row[1])
+        self.menu = m
 
-    def menu_layout(self):
-        m, g = self.menu, self.geo
+    def menu_layout(self, m=None):
+        m, g = m or self.menu, self.geo
         f, fh = g["f_menu"], g["f_menu_hint"]
         ih = f.metrics("linespace") + int(g["h"] * .012)
         sh = max(9, int(g["h"] * .011))
@@ -2281,7 +2530,13 @@ class App:
         w = int(max(w + check_w + padx * 2, g["h"] * .2))
         h = th + 12 + sum(ih if it else sh for it in m["items"])
         x, y = m["x"], m["y"]
-        if m.get("up"):
+        if m.get("anchor"):
+            ax0, ax1, ay = m["anchor"]
+            x = ax1 - 4
+            if x + w > g["w"] - 8:
+                x = ax0 - w + 4
+            y = ay - 6 - th
+        elif m.get("up"):
             y -= h
         x = max(8, min(g["w"] - w - 8, x))
         y = max(8, min(g["h"] - h - 8, y))
@@ -2293,11 +2548,11 @@ class App:
         return {"x0": x, "y0": y, "x1": x + w, "y1": y + h, "rows": rows, "padx": padx,
                 "check_w": check_w, "th": th}
 
-    def menu_hover_index(self, lay):
+    def menu_hover_index(self, lay, m=None):
         if not (lay["x0"] <= self.mx <= lay["x1"]):
             return -1
         for i, y0, y1 in lay["rows"]:
-            it = self.menu["items"][i]
+            it = (m or self.menu)["items"][i]
             if it and it.get("enabled", True) and y0 <= self.my < y1:
                 return i
         return -1
@@ -2305,25 +2560,48 @@ class App:
     def draw_menu(self):
         if not self.menu:
             return
+        m = self.menu
+        while m and m.get("parent"):          # hovering another parent row closes the submenu
+            lay, p = m.get("lay"), m["parent"]
+            if lay and lay["x0"] <= self.mx <= lay["x1"] and lay["y0"] <= self.my <= lay["y1"]:
+                break
+            pl = p.get("lay")
+            if pl:
+                i = self.menu_hover_index(pl, p)
+                if i >= 0 and i != p.get("sub_row"):
+                    self.menu = p
+                    break
+            m = p
+        chain, m = [], self.menu
+        while m:
+            chain.append(m)
+            m = m.get("parent")
+        for m in reversed(chain):
+            if m.get("live"):
+                m["title"], m["items"] = m["live"]()
+            self._draw_menu(m, m is self.menu)
+
+    def _draw_menu(self, m, top):
         c, g = self.canvas, self.geo
-        lay = self.menu_layout()
-        self.menu["lay"] = lay
+        lay = self.menu_layout(m)
+        m["lay"] = lay
         x0, y0, x1, y1 = lay["x0"], lay["y0"], lay["x1"], lay["y1"]
         base = mix(self.tint, (18, 18, 28), .7)
         self.rrect(x0 + 2, y0 + 6, x1 + 2, y1 + 8, 14, fill="#020203", outline="", tags="dyn")
         self.rrect(x0, y0, x1, y1, 14, fill=hexc(base), outline=hexc(mix(base, WHITE, .14)),
                    tags="dyn")
         f, fh = g["f_menu"], g["f_menu_hint"]
-        if self.menu["title"]:
+        if m["title"]:
             c.create_text(x0 + lay["padx"], y0 + 6 + lay["th"] / 2,
-                          text=self.ell(self.menu["title"].upper(), fh, x1 - x0 - 2 * lay["padx"]),
+                          text=self.ell(m["title"].upper(), fh, x1 - x0 - 2 * lay["padx"]),
                           anchor="w", font=fh, fill=hexc(mix(base, WHITE, .45)), tags="dyn")
-        hov = self.menu_hover_index(lay)
-        if hov >= 0:
-            self.menu["sel"] = hov
-        sel = self.menu["sel"]
+        if top:
+            hov = self.menu_hover_index(lay, m)
+            if hov >= 0:
+                m["sel"] = hov
+        sel = m["sel"] if top else m.get("sub_row", -1)
         for i, ry0, ry1 in lay["rows"]:
-            it = self.menu["items"][i]
+            it = m["items"][i]
             if not it:
                 c.create_line(x0 + 12, (ry0 + ry1) / 2, x1 - 12, (ry0 + ry1) / 2,
                               fill=hexc(mix(base, WHITE, .10)), tags="dyn")
@@ -2352,31 +2630,38 @@ class App:
         it = self.menu["items"][i] if self.menu and 0 <= i < len(self.menu["items"]) else None
         if not it or not it.get("enabled", True):
             return
-        if not it.get("keep"):
+        if it.get("sub"):
+            self._sub_parent = (self.menu, i)
+        elif not it.get("keep"):
             self.menu = None
         try:
             it["fn"]()
         except Exception:
             import traceback
             traceback.print_exc()
+        self._sub_parent = None
         if it.get("keep") and self.menu and "checked" in it:
             it["checked"] = not it["checked"]
 
     def menu_click(self, x, y):
-        lay = self.menu.get("lay") or self.menu_layout()
-        if not (lay["x0"] <= x <= lay["x1"] and lay["y0"] <= y <= lay["y1"]):
-            self.menu = None
-            return
-        i = self.menu_hover_index(lay)
-        if i >= 0:
-            self.menu_activate(i)
+        m = self.menu
+        while m:
+            lay = m.get("lay") or self.menu_layout(m)
+            if lay["x0"] <= x <= lay["x1"] and lay["y0"] <= y <= lay["y1"]:
+                self.menu = m
+                i = self.menu_hover_index(lay, m)
+                if i >= 0:
+                    self.menu_activate(i)
+                return
+            m = m.get("parent")
+        self.menu = None
 
     def menu_key(self, k):
         m = self.menu
         items = m["items"]
         valid = [i for i, it in enumerate(items) if it and it.get("enabled", True)]
         if k in ("Escape", "Left"):
-            self.menu = None
+            self.menu = m.get("parent")
         elif k in ("Up", "Down") and valid:
             cur = m["sel"]
             if cur not in valid:
@@ -2868,6 +3153,12 @@ class App:
         if key in ("bg_darkness", "bg_blur"):
             self.built_sig = None
             self.immediate = True
+        if key == "foobar_to_tray" and SETTINGS[key]:
+            if IS_WIN:
+                self.toast("Minimizing foobar2000 now sends it to the tray")
+            else:
+                SETTINGS[key] = False
+                self.toast("Tray option is Windows only")
         if key == "show_translation" and self.geo and self.lines:
             self.layout_lines()
         if key == "lyric_source":
@@ -3032,7 +3323,7 @@ class App:
                 self.skip(float(SETTINGS["seek_step"]))
         elif kind == "util":
             {"shuffle": self.toggle_shuffle, "repeat": self.cycle_repeat,
-             "mute": self.toggle_mute, "help": self.toggle_help,
+             "mute": self.toggle_mute, "help": self.toggle_help, "queue": self.menu_queue,
              "list": self.toggle_playlist}[val]()
         elif kind == "plbtn":
             _, cx, cy, r = next(b for b in self.geo["pl"]["hbtns"] if b[0] == val)
@@ -3147,6 +3438,8 @@ class App:
             self.menu_playlist(e.x, e.y)
         elif kind == "util" and hit[1] in ("shuffle", "repeat"):
             self.order_menu(e.x, e.y - 10)
+        elif kind == "util" and hit[1] == "queue":
+            self.menu_queue(e.x, e.y - 10)
         else:
             self.menu_general(e.x, e.y)
 
@@ -3221,6 +3514,9 @@ class App:
             return True
         if self.settings_open:
             return self.settings_key(k)
+        if k == "q" and shift and not ctrl and not (self.pl_open and self.pl_filter_active):
+            self.menu_queue()
+            return True
         if self.pl_open and self.pl_filter_active and self.filter_key(k, ch, ctrl):
             return True
         if self.pl_open and self.pl_key(k, ch, ctrl, shift, alt):
@@ -3281,7 +3577,9 @@ class App:
             self.pl_nav(0, shift, absolute=0 if k == "Home" else len(self.pl_rows) - 1)
             return True
         if k in ("Return", "KP_Enter"):
-            if 0 <= self.pl_cursor < len(self.pl_items):
+            if len(self.pl_sel) > 1:
+                self.pl_queue_top()
+            elif 0 <= self.pl_cursor < len(self.pl_items):
                 self.pl_play(self.pl_cursor)
             return True
         if k == "Delete" or (IS_MAC and k == "BackSpace"):
@@ -3545,6 +3843,16 @@ class App:
             c.create_line(cx - u * .45, cy + dy * u, cx + u, cy + dy * u, fill=col, width=w,
                           capstyle="round", tags="dyn")
 
+    def icon_queue(self, cx, cy, u, col, w):
+        c = self.canvas
+        for dy in (-.6, 0):
+            c.create_line(cx - u, cy + dy * u, cx + u, cy + dy * u, fill=col, width=w,
+                          capstyle="round", tags="dyn")
+        c.create_polygon(cx - u, cy + .3 * u, cx - u, cy + 1.1 * u, cx - u * .3, cy + .7 * u,
+                         fill=col, outline="", tags="dyn")
+        c.create_line(cx + u * .1, cy + .7 * u, cx + u, cy + .7 * u, fill=col, width=w,
+                      capstyle="round", tags="dyn")
+
     def icon_help(self, cx, cy, u, col, w):
         self.canvas.create_oval(cx - u, cy - u, cx + u, cy + u, outline=col, width=w, tags="dyn")
         self.canvas.create_text(cx, cy, text="?", font=self.geo["f_badge"], fill=col, tags="dyn")
@@ -3688,6 +3996,10 @@ class App:
                 v = self.vol
                 self.icon_speaker(cx, cy, u, colr(name), w, vol_frac(v) if v else 0,
                                   bool(v and v.get("isMuted")))
+            elif name == "queue":
+                on = bool(self.queue_items)
+                self.icon_queue(cx, cy, u, colr(name, on), w)
+                dot(cx, cy, on)
             elif name == "help":
                 self.icon_help(cx, cy, u * .95, colr(name), max(1, w - 1))
             elif name == "list":
