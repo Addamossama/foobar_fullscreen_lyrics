@@ -13,7 +13,7 @@ https://www.foobar2000.org/components/view/foo_beefweb
 http://127.0.0.1:8880
 ```
 
-## Screenshots
+## Screenshots(old)
 
 ![Screenshot 1](screenshots/SS%20(1).png)
 ![Screenshot 2](screenshots/SS%20(2).png)
@@ -34,7 +34,7 @@ Install the release .zip,extract it ,then run the `.exe`.
 * Pillow >= 10.0
 * Tkinter (bundled with Python on Windows/macOS; `python3-tk` on Linux).
 
-Install the release .pyw  
+Install the release .pyw.zip 
 Just double-click it.
 
 ### 3. As a component
