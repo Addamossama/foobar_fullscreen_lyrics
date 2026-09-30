@@ -33,6 +33,7 @@ Install the release .zip,extract it ,then run the `.exe`.
 * Python 3.10+
 * Pillow >= 10.0
 * Tkinter (bundled with Python on Windows/macOS; `python3-tk` on Linux).
+* mutagen
 
 Install the release .pyw.zip 
 Just double-click it.
