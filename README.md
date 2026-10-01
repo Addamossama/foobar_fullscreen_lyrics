@@ -37,7 +37,8 @@ Install the release .zip,extract it ,then run the `.exe`.
 * mutagen
 
 Install the release .pyw.zip 
-Just double-click it.
+extract it.  
+Just double-click .pyw  
 
 ### 3. As a component
 Install the release .fb2k-component  
