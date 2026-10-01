@@ -13,12 +13,8 @@ https://www.foobar2000.org/components/view/foo_beefweb
 http://127.0.0.1:8880
 ```
 
-## Screenshots(old)
+## Screenshots
 
-![Screenshot 1](screenshots/SS%20(1).png)
-![Screenshot 2](screenshots/SS%20(2).png)
-![Screenshot 3](screenshots/SS%20(3).png)
-![Screenshot 4](screenshots/SS%20(4).png)
 
 ## Install
 
