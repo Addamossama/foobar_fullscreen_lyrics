@@ -1,29 +1,18 @@
-"""Foobar Fullscreen Lyrics v9
-
-Fullscreen synced lyrics for foobar2000 (via Beefweb) with an ambient,
-artwork-driven look.  Requires: Python 3.10+, Pillow, foobar2000 + Beefweb.
-
-New in v9
-  * Playlist panel (P): browse every playlist, filter, play, multi-select,
-    drag to reorder, remove, crop, queue, copy to other playlists, sort,
-    randomize, add files / folders / URLs, create / rename / duplicate /
-    clear / delete playlists.
-  * Shuffle, repeat (off / all / one), full playback-order menu, stop after
-    current track, volume slider + mute.
-  * Frosted-glass panels, context menus, toasts, "Up next" card,
-    per-track lyric offset ([ and ]), and a keyboard shortcut sheet (? / F1).
-
-Settings and the lyric cache live next to the script by default (switchable
-to %APPDATA% in Settings -> Data location).
-"""
-import bisect, colorsys, io, json, math, os, queue, random, re, sys, threading, time
+import bisect, colorsys, datetime, io, json, shutil, math, os, queue, random, re, sys, threading, time
+import unicodedata
 import urllib.error, urllib.parse, urllib.request
+from html.parser import HTMLParser
 import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import filedialog
 from pathlib import Path
 from PIL import (Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageOps,
                  ImageTk)
+
+try:  # optional: needed only to write fetched album / artwork into the FLAC files
+    from mutagen.flac import FLAC, Picture
+except Exception:
+    FLAC = Picture = None
 
 try:  # crisp text on Windows high-DPI screens
     import ctypes
@@ -39,6 +28,7 @@ except Exception:
 BEEFWEB = "http://127.0.0.1:8880/api"
 LRCLIB = "https://lrclib.net/api"
 NETEASE = "https://music.163.com/api"
+GENIUS = "https://genius.com"
 POLL_S = 0.15          # how often Beefweb is polled
 TICK_MS = 16           # UI frame interval (~60 fps)
 
@@ -47,7 +37,8 @@ UI_FONTS = ("Segoe UI Variable Display", "Segoe UI", "SF Pro Display",
 DEFAULT_ACCENT = (139, 108, 255)
 WHITE = (255, 255, 255)
 DANGER = (240, 84, 96)
-UA = {"User-Agent": "FoobarLyrics/9.0"}
+APP_VERSION = "3.0"
+UA = {"User-Agent": f"FoobarLyrics/{APP_VERSION}"}
 
 IS_WIN = sys.platform.startswith("win")
 IS_MAC = sys.platform == "darwin"
@@ -105,122 +96,89 @@ def set_app_icon(root):
             pass
 
 
-FB_CLASSES = ("{97E27FAA-C0B3-4b8e-A693-ED7881E99FC1}", "{E7076D1C-A7BF-4f39-B771-BCBE88F2A2A8}")
-
-
-class FoobarTray:
-    """Hides the minimized foobar2000 window and parks a tray icon that restores it."""
-
-    def __init__(self, on_quit, on_show_app, on_missing):
-        self.hwnd, self.icon = None, None
-        self.on_quit, self.on_show_app, self.on_missing = on_quit, on_show_app, on_missing
-        if IS_WIN:
-            from ctypes import wintypes as wt
-            u = self.u = ctypes.windll.user32
-            u.GetWindow.argtypes = [wt.HWND, wt.UINT]
-            u.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
-            for f in (u.IsIconic, u.IsWindow, u.IsWindowVisible, u.SetForegroundWindow):
-                f.argtypes = [wt.HWND]
-            u.ShowWindow.argtypes = [wt.HWND, ctypes.c_int]
-            self.CB = ctypes.WINFUNCTYPE(ctypes.c_int, wt.HWND, wt.LPARAM)
-
-    def find(self):
-        u, found, buf = self.u, [], ctypes.create_unicode_buffer(256)
-
-        def cb(h, _):
-            u.GetClassNameW(h, buf, 256)
-            if buf.value in FB_CLASSES and not u.GetWindow(h, 4):
-                found.append(h)
-                return 0
-            return 1
-        u.EnumWindows(self.CB(cb), 0)
-        return found[0] if found else None
-
-    def poll(self, enabled):
-        if not IS_WIN:
-            return
-        u = self.u
-        if self.hwnd:
-            if not enabled or not u.IsWindow(self.hwnd):
-                self.restore(show=enabled)
-            return
-        if not enabled:
-            return
-        h = self.find()
-        if h and u.IsIconic(h) and u.IsWindowVisible(h):
-            u.ShowWindow(h, 0)
-            self.hwnd = h
-            self.show_icon()
-
-    def restore(self, *_, show=True):
-        h, self.hwnd = self.hwnd, None
-        if h and show and self.u.IsWindow(h):
-            self.u.ShowWindow(h, 9)
-            self.u.SetForegroundWindow(h)
-        elif h and self.u.IsWindow(h):
-            self.u.ShowWindow(h, 9)
-        if self.icon:
-            try:
-                self.icon.stop()
-            except Exception:
-                pass
-            self.icon = None
-
-    def image(self):
-        try:
-            return Image.open(ICON_PATH).convert("RGBA")
-        except Exception:
-            im = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
-            ImageDraw.Draw(im).ellipse((4, 4, 60, 60), fill=DEFAULT_ACCENT + (255,))
-            return im
-
-    def show_icon(self):
-        try:
-            import pystray
-            menu = pystray.Menu(
-                pystray.MenuItem("Show foobar2000", self.restore, default=True),
-                pystray.MenuItem("Show Foobar Lyrics", lambda *_: self.on_show_app()),
-                pystray.MenuItem("Quit Foobar Lyrics", lambda *_: self.on_quit()))
-            self.icon = pystray.Icon("FoobarLyrics", self.image(), "foobar2000", menu)
-            self.icon.run_detached()
-        except Exception:
-            self.icon = None
-            self.restore()
-            self.on_missing()
 APPDATA_DIR = Path(os.getenv("APPDATA") or Path.home()) / "FoobarLyrics"
-
-
-def _bootstrap_settings_path() -> Path:
-    """Locate settings.json before we can read the storage_location setting.
-    Script folder wins if both exist; a fresh install uses the script folder."""
-    script_settings = SCRIPT_DIR / "settings.json"
-    appdata_settings = APPDATA_DIR / "settings.json"
-    if script_settings.exists():
-        return script_settings
-    if appdata_settings.exists():
-        return appdata_settings
-    return script_settings
 
 
 def _dir_for(location: str) -> Path:
     return APPDATA_DIR if location == "appdata" else SCRIPT_DIR
 
 
+def _data_root_for(location: str) -> Path:
+    return _dir_for(location) / "data"
+
+
+def _bootstrap_root() -> Path:
+    """Find the data folder before settings can be read (script folder wins; fresh = script).
+    The old flat layout (settings.json beside the script) is recognised for migration."""
+    for loc in ("script", "appdata"):
+        if (_data_root_for(loc) / "settings" / "settings.json").exists():
+            return _data_root_for(loc)
+    for loc in ("script", "appdata"):
+        if (_dir_for(loc) / "settings.json").exists():
+            return _data_root_for(loc)
+    return _data_root_for("script")
+
+
+DATA_DIR = META_DIR = LOG_DIR = BG_DIR = SETTINGS_PATH = LYRICS_PATH = LIBRARY_PATH = None
+
+
+def set_data_root(root):
+    """Point every storage path at <root>/:
+         settings/settings.json · cache/lyrics/ · cache/metadata/ · library/ (likes + stats)
+         backgrounds/ (uploaded images) · logs/ (created only when something is logged)"""
+    global DATA_DIR, META_DIR, LOG_DIR, BG_DIR, SETTINGS_PATH, LYRICS_PATH, LIBRARY_PATH
+    DATA_DIR = Path(root)
+    SETTINGS_PATH = DATA_DIR / "settings" / "settings.json"
+    LYRICS_PATH = DATA_DIR / "cache" / "lyrics" / "lyrics_cache.json"
+    META_DIR = DATA_DIR / "cache" / "metadata"
+    LIBRARY_PATH = DATA_DIR / "library" / "library.json"
+    BG_DIR = DATA_DIR / "backgrounds"
+    LOG_DIR = DATA_DIR / "logs"
+
+
+def _upgrade_legacy_layout():
+    """One-time move of the old flat files into data/."""
+    old = DATA_DIR.parent
+    pairs = [(old / "settings.json", SETTINGS_PATH), (old / "lyrics_cache.json", LYRICS_PATH),
+             (old / "library.json", LIBRARY_PATH), (old / "meta_cache", META_DIR),
+             (old / "metadata_debug.log", LOG_DIR / "metadata_debug.log")]
+    for s, d in pairs:
+        try:
+            if s.exists() and not d.exists():
+                d.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(s), str(d))
+        except Exception:
+            pass
+
+
+set_data_root(_bootstrap_root())
+_upgrade_legacy_layout()
+
+
 DEFAULT_SETTINGS = {
     "lyric_lead": 0.15,          # highlight a line slightly early (seconds)
     "ui_hide_after": 3.5,        # controls fade out after this many idle seconds
     "show_translation": True,    # show NetEase translated lyrics under each line
-    "lyric_source": "auto",      # "auto" / "lrclib" / "netease"
+    "lyric_source": "auto",      # "auto" / "lrclib" / "netease" / "genius"
+    "genius_fallback": True,     # use Genius (unsynced) when no synced lyrics exist
     "storage_location": "script",  # "script" (next to the .py) / "appdata"
     "font_scale": 1.0,           # global text size multiplier
     "bg_darkness": 1.0,          # background darkening strength
-    "bg_blur": 1.0,              # background blur strength
+    "bg_blur": 1.0,              # background blur strength (artwork / image)
+    "bg_mode": "artwork",        # "artwork" / "color" / "image"
+    "bg_color": [24, 24, 36],    # solid background colour (R, G, B)
+    "bg_image": "",              # saved copy of the uploaded background (file name inside data/backgrounds)
+    "bg_image_name": "",         # its original name, for display
     "seek_step": 10.0,           # seconds for ← / → and the ±10 buttons
     "volume_step": 5.0,          # % of the volume slider per key press
     "show_up_next": True,        # "Up next" card near the end of a track
     "confirm_destructive": True,  # ask before clearing / deleting playlists
-    "foobar_to_tray": False,     # minimizing foobar2000 sends it to the tray
     "queue_repeat": False,       # played queue tracks go back to the end of the queue
+    "playlist_artwork": True,    # album art instead of the track number in the playlist
+    "auto_metadata": False,      # opt-in: look up missing album / artwork automatically while playing
+    "write_metadata": False,     # opt-in (only with auto): also save what was found into the FLAC
+    "show_meta_msgs": True,      # debug: on-screen messages for fetching / writing metadata
+    "meta_debug_log": False,     # debug: append details to metadata_debug.log
     "show_controls": True,
     "show_hint": True,
 }
@@ -378,56 +336,191 @@ class LyricCache:
         return sum(1 for v in self.data.values() if v and v[0])
 
 
-SETTINGS_PATH = _bootstrap_settings_path()
 SETTINGS = Settings(SETTINGS_PATH)
-CACHE = LyricCache(SETTINGS_PATH.parent / "lyrics_cache.json")
+CACHE = LyricCache(LYRICS_PATH)
+
+LIB_TABS = (("liked", "Liked songs"), ("stats", "Statistics"))
+HEART = (255, 84, 120)
+
+
+class Library:
+    """Liked songs + listening statistics, persisted in library.json."""
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.liked, self.plays, self.days, self.total = {}, {}, {}, 0.0
+        self._dirty, self._last_save = False, time.time()
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            self.liked = {k: v for k, v in (d.get("liked") or {}).items() if isinstance(v, dict)}
+            self.plays = {k: v for k, v in (d.get("plays") or {}).items() if isinstance(v, dict)}
+            self.days = {k: float(v) for k, v in (d.get("days") or {}).items()}
+            self.total = float(d.get("total") or 0)
+        except Exception:
+            pass
+
+    def save(self, force=False):
+        if not (self._dirty or force):
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump({"liked": self.liked, "plays": self.plays, "days": self.days,
+                           "total": self.total}, f, ensure_ascii=False)
+            tmp.replace(self.path)
+            self._dirty = False
+            self._last_save = time.time()
+        except Exception:
+            pass
+
+    def autosave(self):
+        if self._dirty and time.time() - self._last_save > 20:
+            self.save()
+
+    @staticmethod
+    def tid(a, t):
+        na, nt = norm(a), norm(t)
+        return f"{na}|{nt}" if (na or nt) else f"{a}|{t}".lower()
+
+    def is_liked(self, a, t):
+        return self.tid(a, t) in self.liked
+
+    def toggle_like(self, a, t, al=""):
+        k = self.tid(a, t)
+        on = k not in self.liked
+        if on:
+            self.liked[k] = {"a": a, "t": t, "al": al, "ts": time.time()}
+        else:
+            del self.liked[k]
+        self._dirty = True
+        self.save()
+        return on
+
+    def unlike(self, key):
+        if self.liked.pop(key, None) is not None:
+            self._dirty = True
+            self.save()
+
+    def liked_list(self):
+        return sorted(self.liked.items(), key=lambda kv: -float(kv[1].get("ts", 0)))
+
+    def add_time(self, secs):
+        day = datetime.date.today().isoformat()
+        self.days[day] = self.days.get(day, 0.0) + secs
+        self.total += secs
+        self._dirty = True
+
+    def add_play(self, a, t):
+        p = self.plays.setdefault(self.tid(a, t), {"a": a, "t": t, "n": 0, "last": 0})
+        p["n"] = int(p.get("n", 0)) + 1
+        p["last"] = time.time()
+        self._dirty = True
+        self.save()
+
+    def week(self):
+        """[(date, seconds)] for Monday..Sunday of the current week."""
+        today = datetime.date.today()
+        mon = today - datetime.timedelta(days=today.weekday())
+        out = []
+        for i in range(7):
+            d = mon + datetime.timedelta(days=i)
+            out.append((d, self.days.get(d.isoformat(), 0.0)))
+        return out
+
+    def top(self, n=5):
+        return sorted(self.plays.items(),
+                      key=lambda kv: (-int(kv[1].get("n", 0)), -float(kv[1].get("last", 0))))[:n]
+
+
+LIB = Library(LIBRARY_PATH)
 
 # name, label, kind, [slider: lo, hi, step, unit] / [choice: options]
 SETTINGS_ROWS = [
     ("lyric_lead",          "Lyric lead",           "slider", 0.0, 1.0, 0.05, "s"),
-    ("lyric_source",        "Lyric source",         "choice", ["auto", "lrclib", "netease"]),
+    ("lyric_source",        "Lyric source",         "choice", ["auto", "lrclib", "netease", "genius"]),
+    ("genius_fallback",     "Genius fallback (unsynced)", "toggle"),
     ("show_translation",    "Show translation",     "toggle"),
     ("font_scale",          "Font scale",           "slider", 0.75, 1.6, 0.05, "×"),
-    ("bg_darkness",         "Background darkness",  "slider", 0.3, 1.6, 0.1, "×"),
-    ("bg_blur",             "Background blur",      "slider", 0.5, 2.0, 0.1, "×"),
+    ("bg_page",             "Background",           "page", "background"),
     ("seek_step",           "Seek step",            "slider", 5.0, 60.0, 5.0, "s"),
     ("volume_step",         "Volume step",          "slider", 1.0, 10.0, 1.0, "%"),
     ("ui_hide_after",       "Auto-hide UI after",   "slider", 1.0, 15.0, 0.5, "s"),
     ("show_controls",       "Show controls",        "toggle"),
     ("show_up_next",        "Show “Up next”",       "toggle"),
+    ("playlist_artwork",    "Artwork in playlist",  "toggle"),
+    ("auto_metadata",       "Auto-fetch missing album/art", "toggle"),
+    ("write_metadata",      "Auto-save fetched tags to files", "toggle"),
     ("show_hint",           "Show hint bar",        "toggle"),
     ("confirm_destructive", "Confirm deletes",      "toggle"),
-    ("foobar_to_tray",      "foobar2000 minimize to tray", "toggle"),
     ("storage_location",    "Data location",        "choice", ["script", "appdata"]),
+    ("debug_page",          "Debug settings",       "page", "debug"),
+]
+
+BG_ROWS = [
+    ("bg_back",     "‹  Back",                      "page", "main"),
+    ("bg_mode",     "Background",                   "choice", ["artwork", "color", "image"]),
+    ("bg_color",    "Solid colour (RGB)",           "color"),
+    ("bg_image",    "Image file",                   "image"),
+    ("bg_darkness", "Darkness (artwork / image)",   "slider", 0.3, 1.6, 0.1, "×"),
+    ("bg_blur",     "Blur (artwork / image)",       "slider", 0.0, 2.0, 0.1, "×"),
+]
+CHOICE_LABELS = {"artwork": "Album artwork", "color": "Solid colour", "image": "Custom image"}
+PAGE_TITLES = {"main": "Settings", "debug": "Debug settings", "background": "Background"}
+
+DEBUG_ROWS = [
+    ("debug_back",          "‹  Back",              "page", "main"),
+    ("show_meta_msgs",      "Show metadata messages", "toggle"),
+    ("meta_debug_log",      "Write debug log file", "toggle"),
+    ("meta_clear_cache",    "Fetched metadata cache", "action"),
 ]
 
 
 def migrate_storage(new_location: str):
-    """Move settings.json + lyrics_cache.json to the new folder and delete
-    the old copies.  Safe to call even if nothing actually moves."""
-    new_dir = _dir_for(new_location)
-    new_settings = new_dir / "settings.json"
-    new_cache = new_dir / "lyrics_cache.json"
-    old_settings = SETTINGS.path
-    old_cache = CACHE.path
+    """Move the whole data folder to the other storage location (script <-> appdata)."""
+    new_root, old_root = _data_root_for(new_location), DATA_DIR
+    if new_root == old_root:
+        return
+    SETTINGS.save()
+    CACHE.save(force=True)
+    LIB.save(force=True)
+    try:
+        shutil.copytree(old_root, new_root, dirs_exist_ok=True)
+    except Exception:
+        return
+    shutil.rmtree(old_root, ignore_errors=True)
+    set_data_root(new_root)
+    SETTINGS.path, CACHE.path, LIB.path = SETTINGS_PATH, LYRICS_PATH, LIBRARY_PATH
+    _META_MEM.clear()
+    SETTINGS.save()
 
-    if new_settings != old_settings:
-        SETTINGS.path = new_settings
-        SETTINGS.save()
-        try:
-            if old_settings.exists() and old_settings != new_settings:
-                old_settings.unlink()
-        except Exception:
-            pass
 
-    if new_cache != old_cache:
-        CACHE.path = new_cache
-        CACHE.save(force=True)
-        try:
-            if old_cache.exists() and old_cache != new_cache:
-                old_cache.unlink()
-        except Exception:
-            pass
+def parse_color(text):
+    """'12, 34, 56' / '12 34 56' / '#1a2b3c' / '1a2b3c' / '#abc'  ->  (r, g, b) or None."""
+    s = (text or "").strip().lower().lstrip("#")
+    if re.fullmatch(r"[0-9a-f]{3}", s):
+        s = "".join(ch * 2 for ch in s)
+    if re.fullmatch(r"[0-9a-f]{6}", s):
+        return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+    if re.fullmatch(r"\d{1,3}\D+\d{1,3}\D+\d{1,3}", s):
+        v = tuple(int(x) for x in re.findall(r"\d+", s))
+        return v if max(v) <= 255 else None
+    return None
+
+
+def prune_bg_images():
+    """Keep only the background image that is currently selected."""
+    keep = SETTINGS["bg_image"]
+    try:
+        for f in BG_DIR.iterdir():
+            if f.is_file() and f.name != keep:
+                f.unlink()
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------- http
@@ -441,6 +534,14 @@ def request_bytes(url, timeout=8):
     req = urllib.request.Request(url, headers=UA)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read()
+
+
+def request_text(url, timeout=8, headers=None):
+    req = urllib.request.Request(url, headers={**UA, **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+        charset = r.headers.get_content_charset() or "utf-8"
+    return raw.decode(charset, "replace")
 
 
 def post_json(url, data=None, timeout=6):
@@ -606,23 +707,442 @@ def fetch_netease(artist, title, duration):
     return []
 
 
+GENIUS_HEADERS = {"User-Agent": NE_HEADERS["User-Agent"], "Accept-Language": "en-US,en;q=0.9"}
+
+
+def gnorm(s):
+    """Accent- and punctuation-insensitive key used to match Genius results."""
+    s = unicodedata.normalize("NFKD", (s or "").lower())
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return re.sub(r"[\W_]+", "", s)
+
+
+class _GeniusParser(HTMLParser):
+    """Collects the text of every <div data-lyrics-container="true"> on a Genius page."""
+    VOID = {"br", "img", "hr", "input", "meta", "link", "wbr", "area", "base", "col",
+            "embed", "source", "track", "param"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.out, self.stack = [], []      # stack: (tag, opens_box, opens_skip)
+        self.in_box = self.skip = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "br":
+            if self.in_box and not self.skip:
+                self.out.append("\n")
+            return
+        if tag in self.VOID:
+            return
+        a = dict(attrs)
+        box = a.get("data-lyrics-container") == "true"
+        if box:
+            self.in_box += 1
+        skip = bool(self.in_box) and a.get("data-exclude-from-selection") == "true"
+        if skip:
+            self.skip += 1
+        self.stack.append((tag, box, skip))
+
+    def handle_endtag(self, tag):
+        if tag in self.VOID:
+            return
+        for i in range(len(self.stack) - 1, -1, -1):
+            if self.stack[i][0] == tag:
+                for _, box, skip in reversed(self.stack[i:]):
+                    if skip:
+                        self.skip -= 1
+                    if box:
+                        self.in_box -= 1
+                        self.out.append("\n")
+                del self.stack[i:]
+                return
+
+    def handle_data(self, data):
+        if self.in_box and not self.skip:
+            self.out.append(data)
+
+
+PLAIN_JUNK_RE = re.compile(r"(?i)you might also like|\d*embed")
+
+
+def tidy_plain(text):
+    """Plain lyric text -> list of lines; '' marks a stanza break.  [Section]
+    headers and site junk are dropped, blank runs collapsed."""
+    out = []
+
+    def brk():
+        if out and out[-1] != "":
+            out.append("")
+    for raw in (text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        ln = re.sub(r"[ \t\u00a0]+", " ", raw).strip()
+        if not ln or re.fullmatch(r"\[[^\]]*\]", ln):
+            brk()
+        elif PLAIN_JUNK_RE.fullmatch(ln):
+            continue
+        else:
+            out.append(ln)
+    while out and out[-1] == "":
+        out.pop()
+    return out
+
+
+def parse_genius_html(page):
+    parser = _GeniusParser()
+    parser.feed(page or "")
+    parser.close()
+    lines = tidy_plain("".join(parser.out))
+    return lines if sum(1 for x in lines if x) >= 2 else []
+
+
+def fetch_genius(artist, title):
+    """Genius: search -> best matching song page -> unsynced lyric text (list of lines)."""
+    nartist = gnorm(artist)
+    if nartist in ("variousartists", "va"):
+        nartist = ""
+    wanted = gnorm(title)
+    wanted_clean = gnorm(clean_title(title))
+    queries = dict.fromkeys([f"{artist} {title}".strip(),
+                             f"{artist} {clean_title(title)}".strip()])
+    tried = set()
+    for qs in queries:
+        if not qs:
+            continue
+        try:
+            res = get_json(GENIUS + "/api/search/multi?" + urllib.parse.urlencode(
+                {"per_page": 5, "q": qs}), 8, GENIUS_HEADERS)
+        except Exception:
+            continue
+        hits = []
+        for sec in (res.get("response") or {}).get("sections") or []:
+            for h in sec.get("hits") or []:
+                r = h.get("result")
+                if h.get("type") == "song" and isinstance(r, dict) and r.get("url"):
+                    hits.append(r)
+        cands = []
+        for pos, r in enumerate(hits):
+            url = r["url"]
+            name = gnorm(r.get("title"))
+            who = gnorm((r.get("primary_artist") or {}).get("name"))
+            if url in tried or not name or "genius" in who:      # skip Genius' own translation pages
+                continue
+            if r.get("lyrics_state") not in (None, "complete"):
+                continue
+            if nartist and who and not (who in nartist or nartist in who):
+                continue
+            if name in (wanted, wanted_clean):
+                rank = 0
+            elif any(w and (w in name or name in w)
+                     and min(len(w), len(name)) >= .55 * max(len(w), len(name))
+                     for w in (wanted, wanted_clean)):
+                rank = 1
+            else:
+                continue
+            cands.append((rank, pos, url))
+        for _, _, url in sorted(cands)[:2]:
+            tried.add(url)
+            try:
+                lines = parse_genius_html(request_text(url, 10, GENIUS_HEADERS))
+            except Exception:
+                continue
+            if lines:
+                return lines
+    return []
+
+
+def is_synced(lines):
+    """Synced lyrics have times >= 0; unsynced ones (Genius / plain text) use -1."""
+    return bool(lines) and lines[0][0] >= 0
+
+
+def lines_from_text(text):
+    """Manually supplied lyrics: LRC text becomes synced lines, anything else unsynced."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff")
+    synced = parse_lrc(text)
+    if len(synced) >= 2:
+        return [(t, x, "") for t, x in synced]
+    return [(-1.0, x, "") for x in tidy_plain(text)]
+
+
 def fetch_lyrics(artist, title, album, duration):
-    """Returns (lines, source). Each line is (time, text, translation)."""
+    """Returns (lines, source). Each line is (time, text, translation); Genius
+    lines are unsynced and carry time -1."""
     source = SETTINGS["lyric_source"]
     order = ["lrclib", "netease"]
     if source == "netease" or (source == "auto" and CJK_RE.search(artist + title)):
         order.reverse()
+    if source == "genius":
+        order.insert(0, "genius")
+    elif SETTINGS["genius_fallback"]:
+        order.append("genius")            # last resort: text without timestamps
+    names = {"lrclib": "LRCLIB", "netease": "NetEase", "genius": "Genius"}
     for src in order:
         try:
             if src == "lrclib":
                 lines = [(t, x, "") for t, x in fetch_lrclib(artist, title, album, duration)]
-            else:
+            elif src == "netease":
                 lines = fetch_netease(artist, title, duration)
+            else:
+                lines = [(-1.0, x, "") for x in fetch_genius(artist, title)]
         except Exception:
             lines = []
         if lines:
-            return lines, ("NetEase" if src == "netease" else "LRCLIB")
+            return lines, names[src]
     return [], ""
+
+
+# ------------------------------------------------------- online metadata
+ITUNES = "https://itunes.apple.com/search"
+DEEZER = "https://api.deezer.com/search"
+_META_MEM = {}
+
+
+def _meta_id(artist, title):
+    return re.sub(r"[\W_]+", "", f"{artist}|{clean_title(title)}".lower()) or "x"
+
+
+def _title_ok(want, got):
+    w, g = norm(clean_title(want)), norm(clean_title(got))
+    if not w or not g:
+        return False
+    if w == g:
+        return True
+    short, long_ = sorted((w, g), key=len)
+    return short in long_ and len(short) / len(long_) >= 0.6
+
+
+def _artist_ok(want, got):
+    w, g = norm(want), norm(got)
+    if not w or not g:
+        return False
+    if w in g or g in w:
+        return True
+    # "A & B" / "A feat. B" / "A; B": any credited name matching is enough
+    parts = [norm(x) for x in re.split(r"\s*(?:&|,|;|/|feat\.?|ft\.?|x|and)\s*", want, flags=re.I)]
+    return any(x and (x in g or g in x) for x in parts)
+
+
+def _score(cand_artist, cand_title, cand_secs, artist, title, duration):
+    if not _artist_ok(artist, cand_artist) or not _title_ok(title, cand_title):
+        return None
+    sc = 2 if norm(clean_title(title)) == norm(clean_title(cand_title)) else 1
+    if duration and cand_secs:
+        d = abs(duration - cand_secs)
+        if d > 8:
+            return None                       # different recording (live / long edit)
+        sc += 2 if d <= 3 else 0
+    return sc
+
+
+def _lookup_itunes(artist, title, duration):
+    term = f"{artist} {clean_title(title)}"
+    data = get_json(f"{ITUNES}?" + urllib.parse.urlencode(
+        {"term": term, "entity": "song", "limit": 15, "media": "music"}), 8)
+    best, best_sc = None, 0
+    for r in data.get("results") or []:
+        sc = _score(r.get("artistName", ""), r.get("trackName", ""),
+                    (r.get("trackTimeMillis") or 0) / 1000.0, artist, title, duration)
+        if sc and sc > best_sc:
+            best, best_sc = r, sc
+    if not best or not best.get("collectionName"):
+        return None
+    art = best.get("artworkUrl100") or ""
+    urls = [art.replace("100x100bb", "1200x1200bb"), art.replace("100x100bb", "600x600bb")] if art else []
+    album = re.sub(r"\s*-\s*(Single|EP)$", "", best["collectionName"])
+    return {"album": album, "album_artist": best.get("collectionArtistName") or best.get("artistName", ""),
+            "year": str(best.get("releaseDate") or "")[:4], "art_urls": urls}
+
+
+def _lookup_deezer(artist, title, duration):
+    qs = f'artist:"{artist}" track:"{clean_title(title)}"'
+    data = get_json(f"{DEEZER}?" + urllib.parse.urlencode({"q": qs, "limit": 15}), 8)
+    best, best_sc = None, 0
+    for r in data.get("data") or []:
+        sc = _score((r.get("artist") or {}).get("name", ""), r.get("title", ""),
+                    r.get("duration") or 0, artist, title, duration)
+        if sc and sc > best_sc:
+            best, best_sc = r, sc
+    if not best:
+        return None
+    alb = best.get("album") or {}
+    if not alb.get("title"):
+        return None
+    urls = [alb.get(k) for k in ("cover_xl", "cover_big", "cover_medium") if alb.get(k)]
+    return {"album": alb["title"], "album_artist": (best.get("artist") or {}).get("name", ""),
+            "year": "", "art_urls": urls}
+
+
+def _download_art(urls):
+    for u in urls:
+        try:
+            raw = request_bytes(u, 10)
+            im = Image.open(io.BytesIO(raw))
+            im.load()
+            if min(im.size) < 200:
+                continue
+            return raw
+        except Exception:
+            continue
+    return None
+
+
+def fetch_online_meta(artist, title, duration=0.0):
+    """Album / year / artwork for a track from its artist + title.
+    Returns {"album", "album_artist", "year", "art": bytes|None} or None. Cached on disk."""
+    if not (artist and title):
+        return None
+    mid = _meta_id(artist, title)
+    if mid in _META_MEM:
+        return _META_MEM[mid]
+    jpath, apath = META_DIR / f"{mid[:80]}.json", META_DIR / f"{mid[:80]}.art"
+    try:
+        info = json.loads(jpath.read_text(encoding="utf-8"))
+        info["art"] = apath.read_bytes() if apath.exists() else None
+        info["mid"] = mid
+        _META_MEM[mid] = info
+        return info
+    except Exception:
+        pass
+    info, fallback = None, None
+    for fn in (_lookup_itunes, _lookup_deezer):
+        try:
+            cand = fn(artist, title, duration)
+        except Exception:
+            cand = None
+        if not cand:
+            continue
+        cand["art"] = _download_art(cand.pop("art_urls", []))
+        if cand["art"]:
+            info = cand
+            break
+        fallback = fallback or cand            # album but no art: let the next source try
+    info = info or fallback
+    if not info:
+        return None                            # not cached: a later play may succeed
+    info["mid"] = mid
+    try:
+        META_DIR.mkdir(parents=True, exist_ok=True)
+        jpath.write_text(json.dumps({k: v for k, v in info.items() if k != "art"},
+                                    ensure_ascii=False), encoding="utf-8")
+        if info.get("art"):
+            apath.write_bytes(info["art"])
+    except Exception:
+        pass
+    _META_MEM[mid] = info
+    return info
+
+
+def meta_log(msg):
+    if not SETTINGS["meta_debug_log"]:
+        return
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_DIR / "metadata_debug.log", "a", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S  ") + str(msg) + "\n")
+    except Exception:
+        pass
+
+
+def drop_meta_cache(mid):
+    """Delete the cached lookup (json + artwork) for one track."""
+    if not mid:
+        return
+    _META_MEM.pop(mid, None)
+    for ext in (".json", ".art"):
+        try:
+            (META_DIR / f"{mid[:80]}{ext}").unlink()
+        except Exception:
+            pass
+
+
+def meta_cache_size():
+    try:
+        return sum(1 for _ in META_DIR.glob("*.json"))
+    except Exception:
+        return 0
+
+
+def clear_meta_cache():
+    n = meta_cache_size()
+    _META_MEM.clear()
+    try:
+        for f in META_DIR.glob("*"):
+            if f.suffix in (".json", ".art"):
+                f.unlink()
+    except Exception:
+        pass
+    return n
+
+
+def flac_read(path):
+    """(album, cover bytes | None) as currently stored inside a FLAC."""
+    if FLAC is None:
+        return "", None
+    try:
+        f = FLAC(path)
+        album = next((str(v).strip() for v in f.get("album", []) if str(v).strip()), "")
+        return album, (f.pictures[0].data if f.pictures else None)
+    except Exception:
+        return "", None
+
+
+def is_lock_error(e):
+    """mutagen wraps the OS 'file in use' error in its own exception type."""
+    return (isinstance(e, OSError) or isinstance(e.__cause__, OSError)
+            or isinstance(e.__context__, OSError) or any(isinstance(a, OSError) for a in e.args))
+
+
+def flac_missing(path):
+    """(needs_album, needs_art) for a FLAC file, or None if unreadable."""
+    if FLAC is None:
+        return None
+    try:
+        f = FLAC(path)
+    except Exception:
+        return None
+    return (not any(str(v).strip() for v in f.get("album", [])), not f.pictures)
+
+
+def write_flac_meta(path, info, only_missing=True):
+    """Write album (and year / album artist / cover) into a FLAC.  Returns a list of what
+    was written; raises PermissionError / OSError if the file is locked (still playing)."""
+    if FLAC is None:
+        raise RuntimeError("mutagen is not installed")
+    try:
+        open(path, "rb+").close()              # raises if another program (foobar2000) holds it
+    except OSError as e:
+        raise PermissionError(str(e))
+    f = FLAC(path)
+    wrote = []
+    has_album = any(str(v).strip() for v in f.get("album", []))
+    if info.get("album") and (not has_album or not only_missing):
+        f["album"] = info["album"]
+        wrote.append("album")
+        if info.get("album_artist") and not f.get("albumartist") and not f.get("album artist"):
+            f["albumartist"] = info["album_artist"]
+        if info.get("year") and not f.get("date") and not f.get("year"):
+            f["date"] = info["year"]
+    if info.get("art") and (not f.pictures or not only_missing):
+        im = Image.open(io.BytesIO(info["art"]))
+        pic = Picture()
+        pic.type, pic.desc = 3, "Cover"
+        if im.format == "PNG":
+            pic.mime = "image/png"
+            pic.data = info["art"]
+        else:
+            pic.mime = "image/jpeg"
+            if im.format == "JPEG":
+                pic.data = info["art"]
+            else:
+                buf = io.BytesIO()
+                im.convert("RGB").save(buf, "JPEG", quality=92)
+                pic.data = buf.getvalue()
+        pic.width, pic.height, pic.depth = im.size[0], im.size[1], 24
+        f.clear_pictures()
+        f.add_picture(pic)
+        wrote.append("artwork")
+    if wrote:
+        f.save()
+    return wrote
 
 
 # ------------------------------------------------------------------ helpers
@@ -843,6 +1363,16 @@ def rounded_mask(w, h, r):
     return m
 
 
+def make_thumb(im, s, dim=False, rad=.16):
+    """Small rounded album-art tile for playlist rows (optionally dimmed)."""
+    t = im.resize((s, s), Image.Resampling.LANCZOS)
+    if dim:
+        t = ImageEnhance.Brightness(t).enhance(.4)
+    out = t.convert("RGBA")
+    out.putalpha(rounded_mask(s, s, max(3, int(s * rad))))
+    return out
+
+
 def make_glass(src, box, radius, tint, lift=0.62, veil=0.38):
     """Frosted-glass panel: blurred, dimmed crop of `src` + sheen + hairline."""
     x0, y0, x1, y1 = [int(round(v)) for v in box]
@@ -870,21 +1400,47 @@ def make_glass(src, box, radius, tint, lift=0.62, veil=0.38):
     return out, tuple(avg[:3])
 
 
-def build_assets(raw, w, h, cs, darkness=1.0, blur=1.0):
+def build_assets(raw, w, h, cs, darkness=1.0, blur=1.0, opts=None):
+    """raw = album artwork (always the cover). opts picks the background source:
+    {"mode": "artwork" | "color" | "image", "color": (r, g, b), "path": image file}."""
+    opts = opts or {}
+    mode = opts.get("mode", "artwork")
     if raw is None:
         accent = DEFAULT_ACCENT
-        bg = fallback_bg(w, h, accent)
         cover = placeholder_cover(cs, accent)
     else:
         accent = pick_accent(raw)
-        sw, sh = max(64, w // 10), max(36, h // 10)
-        blur_px = max(2, int(max(6, sw // 9) * max(0.2, blur)))
-        small = cover_crop(raw, sw, sh).filter(ImageFilter.GaussianBlur(blur_px))
-        small = ImageEnhance.Color(small).enhance(1.45)
-        small = ImageEnhance.Brightness(small).enhance(.68)
-        bg = small.resize((w, h), Image.Resampling.BICUBIC)
         cover = cover_crop(raw, cs, cs)
-    bg = shade(bg, darkness)
+    user = None
+    if mode == "image" and opts.get("path"):
+        try:
+            user = Image.open(opts["path"])
+            user.load()
+            user = user.convert("RGB")
+        except Exception:
+            user = None                          # missing / unreadable: fall back to artwork
+    if mode == "color":
+        bg = Image.new("RGB", (w, h), tuple(opts.get("color") or (24, 24, 36)))
+    else:
+        if user is not None:
+            accent = pick_accent(user)
+            if blur <= 0.05:
+                bg = cover_crop(user, w, h)
+            else:
+                sw, sh = max(64, w // 3), max(36, h // 3)
+                bg = cover_crop(user, sw, sh).filter(
+                    ImageFilter.GaussianBlur(max(1.0, blur * h * .02 / 3)))
+                bg = bg.resize((w, h), Image.Resampling.BICUBIC)
+        elif raw is None:
+            bg = fallback_bg(w, h, accent)
+        else:
+            sw, sh = max(64, w // 10), max(36, h // 10)
+            blur_px = max(2, int(max(6, sw // 9) * max(0.2, blur)))
+            small = cover_crop(raw, sw, sh).filter(ImageFilter.GaussianBlur(blur_px))
+            small = ImageEnhance.Color(small).enhance(1.45)
+            small = ImageEnhance.Brightness(small).enhance(.68)
+            bg = small.resize((w, h), Image.Resampling.BICUBIC)
+        bg = shade(bg, darkness)
     tint = bg.crop((w // 2, 0, w, h)).resize((1, 1), Image.Resampling.BOX).getpixel((0, 0))
     scrim = bg.resize((max(32, w // 14), max(18, h // 14)), Image.Resampling.BILINEAR)
     scrim = ImageEnhance.Brightness(scrim.filter(ImageFilter.GaussianBlur(1.6))).enhance(.45)
@@ -923,6 +1479,8 @@ SHORTCUTS = {
         (["\\"], "Reset lyric offset"),
         (["V"], "Show / hide translation"),
         (["R"], "Search lyrics again"),
+        (["E"], "Manual lyrics (paste / load file)"),
+        (["Ctrl", P("+"), "V"], "Paste lyrics from clipboard"),
         ([P("Wheel · Click")], "Browse · jump to line"),
     ],
     "Playlist": [
@@ -943,6 +1501,11 @@ SHORTCUTS = {
         (["Ctrl", P("+"), "W"], "Delete playlist"),
         ([P("Right-click")], "More actions"),
     ],
+    "Library": [
+        (["L"], "Like / unlike this song"),
+        (["Shift", P("+"), "L"], "Liked songs"),
+        (["T"], "Statistics"),
+    ],
     "Window": [
         (["S"], "Settings"),
         (["?", P("or"), "F1"], "This sheet"),
@@ -951,8 +1514,8 @@ SHORTCUTS = {
         (["Ctrl", P("+"), "Q"], "Quit"),
     ],
 }
-HELP_COLS_WIDE = [["Playback", "Sound & order"], ["Playlist"], ["Lyrics", "Window"]]
-HELP_COLS_NARROW = [["Playback", "Sound & order", "Window"], ["Playlist", "Lyrics"]]
+HELP_COLS_WIDE = [["Playback", "Sound & order", "Library"], ["Playlist"], ["Lyrics", "Window"]]
+HELP_COLS_NARROW = [["Playback", "Sound & order", "Library", "Window"], ["Playlist", "Lyrics"]]
 
 
 # ---------------------------------------------------------------------- app
@@ -972,7 +1535,7 @@ class App:
         self._fonts, self._ell, self._mw = {}, {}, {}
 
         now = time.perf_counter()
-        self.remote = {"seq": 0, "ok": False, "a": "", "t": "", "al": "",
+        self.remote = {"seq": 0, "ok": False, "a": "", "t": "", "al": "", "path": "",
                        "pos": 0.0, "dur": 0.0, "playing": False, "state": "stopped",
                        "stamp": now, "pl_id": None, "idx": -1, "orders": [], "order": None,
                        "order_api": None, "stop_after": None, "vol": None, "perm_pl": True,
@@ -1010,6 +1573,9 @@ class App:
         self.pl_drag = None
         self.pl_sb_drag = False
         self.pl_base = (24, 24, 34)
+        self.pl_art, self.pl_art_photos = {}, {}   # key -> PIL thumb / False (none); key -> tk photo
+        self.pl_art_pending, self.pl_art_fail = set(), {}
+        self.pl_art_q = queue.LifoQueue()          # newest request (= visible row) first
         self.sort_desc = False
         self.edit_q = queue.Queue()
         self.edit_gen, self.jobs_pending = 0, 0
@@ -1017,9 +1583,17 @@ class App:
         # up next
         self.next_sig, self.up_next, self.upnext_anim = None, None, 0.0
 
+        # likes + statistics
+        self.heard, self.counted, self._st_t = 0.0, 0, None
+        self.like_anim, self.like_pop = 0.0, (0.0, 0)
+        self.lib_open, self.lib_tab, self.lib_lay, self.lib_hits = False, "liked", None, []
+        self.lib_scroll = self.lib_target = 0.0
+        self.lib_sel = 0
+
         # lyrics
         self.lines, self.times, self.lines_ver = [], [], 0
         self.lyric_source = ""
+        self.synced = True                     # False for Genius / plain-text lyrics
         self.lyr_offset = 0.0
         self.line_trows, self.line_oh = [], []
         self.lyric_state = "idle"
@@ -1031,6 +1605,8 @@ class App:
 
         # artwork / assets
         self.art_raw, self.art_ver = None, 0
+        self.cur_path, self.meta_pending, self.meta_lock = "", {}, threading.Lock()
+        self.settings_page, self.meta_cache_n = "main", 0
         self.bg_photo = self.cover_photo = None
         self.bg_pil = self.scrim_pil = None
         self.scrim_photo = None
@@ -1080,13 +1656,12 @@ class App:
         root.bind("<Key>", self.on_keypress)
         root.protocol("WM_DELETE_WINDOW", self.close)
 
-        self.tray = FoobarTray(lambda: self.events.put(("quit",)),
-                               lambda: self.events.put(("show_app",)),
-                               lambda: self.events.put(("tray_missing",)))
         self._sub_parent = None
         threading.Thread(target=self.poll_loop, daemon=True).start()
         threading.Thread(target=self.edit_loop, daemon=True).start()
-        threading.Thread(target=self.tray_loop, daemon=True).start()
+        threading.Thread(target=self.meta_retry_loop, daemon=True).start()
+        for _ in range(2):
+            threading.Thread(target=self.pl_art_loop, daemon=True).start()
         root.after(30, self.tick)
         root.after(200, lambda: (root.focus_force(), c.focus_set()))
 
@@ -1116,23 +1691,12 @@ class App:
             r = self._mw[k] = font.measure(text)
         return r
 
-    def tray_loop(self):
-        while self.alive:
-            try:
-                self.tray.poll(bool(SETTINGS["foobar_to_tray"]))
-            except Exception:
-                pass
-            time.sleep(0.4)
-
     def close(self):
         self.alive = False
         try:
-            self.tray.restore()
-        except Exception:
-            pass
-        try:
             SETTINGS.save()
             CACHE.save(force=True)
+            LIB.save(force=True)
         except Exception:
             pass
         self.root.destroy()
@@ -1171,6 +1735,55 @@ class App:
                 self.events.put(("resync",))
             self.events.put(("job_done",))
 
+    def pl_art_loop(self):
+        while self.alive:
+            try:
+                key, pid, idx = self.pl_art_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            res = None
+            try:
+                data = request_bytes(f"{BEEFWEB}/artwork/{q(pid)}/{idx}", 8)
+            except urllib.error.HTTPError as e:
+                res = False if 400 <= e.code < 500 else None    # 404 = track has no artwork
+            except Exception:
+                res = None                                       # network hiccup: retry later
+            else:
+                try:
+                    im = Image.open(io.BytesIO(data))
+                    try:
+                        im.draft("RGB", (256, 256))              # fast JPEG downscale
+                    except Exception:
+                        pass
+                    im.load()
+                    res = cover_crop(im.convert("RGB"), 128, 128)
+                except Exception:
+                    res = False
+            self.events.put(("plart", key, res))
+
+    def pl_art_request(self, key, idx):
+        if (key in self.pl_art_pending or not self.connected or not self.pl_view_id
+                or time.perf_counter() - self.pl_art_fail.get(key, -99.0) < 8):
+            return
+        self.pl_art_pending.add(key)
+        self.pl_art_q.put((key, self.pl_view_id, idx))
+
+    def pl_art_photo(self, it, real, s, dim=False):
+        """Tk photo for a playlist row's artwork, or None while loading / if it has none."""
+        a, t, al = it[0].lower(), it[1].lower(), it[2].lower()
+        key = ("al", a, al) if al else ("t", a, t)    # one fetch per album, not per track
+        im = self.pl_art.get(key)
+        if im is None:
+            self.pl_art_request(key, real)
+            return None
+        if im is False:
+            return None
+        pk = (key, s, dim)
+        ph = self.pl_art_photos.get(pk)
+        if ph is None:
+            ph = self.pl_art_photos[pk] = ImageTk.PhotoImage(make_thumb(im, s, dim))
+        return ph
+
     def poll_loop(self):
         use_queue = True
         seq = 0
@@ -1178,7 +1791,7 @@ class App:
             t0 = time.perf_counter()
             seq += 1
             try:
-                params = {"player": "true", "trcolumns": "%artist%,%title%,%album%",
+                params = {"player": "true", "trcolumns": "%artist%,%title%,%album%,%path%",
                           "playlists": "true"}
                 if use_queue:
                     params.update(playQueue="true", qcolumns="%title%,%artist%")
@@ -1204,7 +1817,7 @@ class App:
                     orders, order, api = list(p["playbackModes"]), p.get("playbackMode"), "legacy"
                 state = str(p.get("playbackState", "")).lower()
                 self.remote = {
-                    "seq": seq, "ok": True, "a": col(0), "t": col(1), "al": col(2),
+                    "seq": seq, "ok": True, "a": col(0), "t": col(1), "al": col(2), "path": col(3),
                     "pos": float(item.get("position") or 0),
                     "dur": float(item.get("duration") or 0),
                     "playing": state == "playing", "state": state,
@@ -1453,7 +2066,7 @@ class App:
 
         key = (r["a"], r["t"], r["al"])
         if key != self.track_key and (key[0] or key[1]):
-            self.on_track_change(key, r["dur"])
+            self.on_track_change(key, r["dur"], r.get("path", ""))
 
     def sync_playlists(self, pls, now):
         self.playlists = pls
@@ -1475,8 +2088,11 @@ class App:
                       (now - self.pl_last_fetch > 6 and cnt < 6000 and not self.pl_drag)):
             self.pl_request_items()
 
-    def on_track_change(self, key, dur):
+    def on_track_change(self, key, dur, path=""):
         self.track_key = self.track = key
+        self.cur_path = path
+        self.heard, self.counted = 0.0, 0
+        self.like_anim, self.like_pop = (1.0 if LIB.is_liked(key[0], key[1]) else 0.0), (0.0, 0)
         self.lines, self.times, self.focus = [], [], []
         self.lyric_source = ""
         self.lyr_offset = CACHE.get_offset(key)
@@ -1487,7 +2103,7 @@ class App:
         self.static_dirty = True
         self.root.title(" — ".join(x for x in key[:2] if x) or "Foobar Lyrics")
         threading.Thread(target=self.lyrics_worker, args=(key, dur, False), daemon=True).start()
-        threading.Thread(target=self.art_worker, args=(key,), daemon=True).start()
+        threading.Thread(target=self.art_worker, args=(key, dur, path), daemon=True).start()
 
     def lyrics_worker(self, key, dur, force=False):
         if not force:
@@ -1506,7 +2122,79 @@ class App:
                 pass
         self.events.put(("lyrics", key, lines, src))
 
-    def art_worker(self, key):
+    # ------------------------------------------------------ metadata (album / artwork)
+    def meta_msg(self, msg):
+        """Every metadata status message goes through here (Settings > Debug can mute it)."""
+        meta_log(msg)
+        if SETTINGS["show_meta_msgs"]:
+            self.events.put(("toast", msg))
+
+    @staticmethod
+    def meta_result_text(r):
+        return {"ok": "Written album & artwork to the file · cache removed",
+                "skip": "File already has album & artwork · cache removed",
+                "queued": "Will write to the file after the song ends",
+                "locked": "File is in use — will write after the song ends",
+                "nomutagen": "Install mutagen to write tags:  pip install mutagen",
+                "notflac": "Not a FLAC file — can't write tags",
+                "error": "Couldn't write the tags to the file"}.get(r, "")
+
+    def try_write_meta(self, path, info):
+        if FLAC is None:
+            return "nomutagen"
+        if not str(path).lower().endswith(".flac"):
+            return "notflac"
+        try:
+            wrote = write_flac_meta(path, info)
+        except Exception as e:
+            if is_lock_error(e):
+                with self.meta_lock:
+                    self.meta_pending[path] = info
+                meta_log(f"file in use, queued: {path} ({e!r})")
+                return "locked"
+            meta_log(f"write failed: {path} ({e!r})")
+            return "error"
+        drop_meta_cache(info.get("mid"))
+        meta_log(f"wrote {wrote} to {path}; cache removed")
+        return "ok" if wrote else "skip"
+
+    def submit_meta(self, path, info):
+        """Write now — or, if this is the file foobar2000 is playing, queue it until it ends."""
+        if self.playing and path == self.cur_path:
+            with self.meta_lock:
+                self.meta_pending[path] = info
+            return "queued"
+        return self.try_write_meta(path, info)
+
+    def meta_retry_loop(self):
+        """Writes queued tags as soon as the file is no longer the one playing / locked."""
+        while True:
+            time.sleep(2.0)
+            try:
+                with self.meta_lock:
+                    todo = [(p, i) for p, i in self.meta_pending.items()
+                            if not (self.playing and p == self.cur_path)]
+                    for p, _ in todo:
+                        self.meta_pending.pop(p, None)
+                for p, i in todo:
+                    r = self.try_write_meta(p, i)
+                    if r in ("ok", "skip", "error", "nomutagen", "notflac"):
+                        self.meta_msg(self.meta_result_text(r))
+            except Exception:
+                pass
+
+    @staticmethod
+    def _to_art(raw_bytes):
+        try:
+            im = Image.open(io.BytesIO(raw_bytes))
+            im.load()
+            im = im.convert("RGB")
+            im.thumbnail((1200, 1200))
+            return im
+        except Exception:
+            return None
+
+    def art_worker(self, key, dur=0.0, path=""):
         raw = None
         for _ in range(3):
             if key != self.track_key:
@@ -1519,11 +2207,116 @@ class App:
                 break
             except Exception:
                 time.sleep(0.6)
+        need_art, need_album = raw is None, not key[2]
+        info = None
+        if (need_art or need_album) and SETTINGS["auto_metadata"] and key[0] and key[1]:
+            missing = flac_missing(path) if str(path).lower().endswith(".flac") else None
+            if missing is not None and not any(missing):
+                # the file already holds album + cover; foobar2000 just hasn't re-read its tags
+                fa, fart = flac_read(path)
+                if need_art and fart:
+                    raw = self._to_art(fart)
+                if need_album and fa:
+                    self.events.put(("album", key, fa))
+                self.meta_msg("Tags are already in the file — reload info in foobar2000")
+            else:
+                self.meta_msg("Fetching album & artwork…")
+                try:
+                    info = fetch_online_meta(key[0], key[1], dur)
+                except Exception as e:
+                    meta_log(f"lookup failed: {e!r}")
+                    info = None
+                if key != self.track_key:
+                    return
+                if not info:
+                    self.meta_msg("No match found online")
+                else:
+                    self.meta_msg("Found: " + (info.get("album") or "?")
+                                  + ("" if info.get("art") else "  (no artwork)"))
+                    if need_art and info.get("art"):
+                        raw = self._to_art(info["art"]) or raw
+                    if need_album and info.get("album"):
+                        self.events.put(("album", key, info["album"]))
         self.events.put(("art", key, raw))
+        if info and SETTINGS["write_metadata"] and path and (need_art or need_album):
+            self.meta_msg(self.meta_result_text(self.submit_meta(path, info)))
 
-    def asset_worker(self, seq, raw, w, h, cs, darkness, blur):
+    def fetch_current_meta(self):
+        """Manual: look up album / artwork for the playing track, show it, write it to the FLAC."""
+        key, path, dur = self.track_key, self.cur_path, self.duration
+        if not key or not (key[0] and key[1]):
+            self.meta_msg("Nothing playing")
+            return
+        self.meta_msg("Fetching album & artwork…")
+
+        def run():
+            try:
+                info = fetch_online_meta(key[0], key[1], dur)
+            except Exception as e:
+                meta_log(f"lookup failed: {e!r}")
+                info = None
+            if not info:
+                self.meta_msg("No match found online")
+                return
+            self.meta_msg("Found: " + (info.get("album") or "?")
+                          + ("" if info.get("art") else "  (no artwork)"))
+            if key == self.track_key:
+                if info.get("album") and not key[2]:
+                    self.events.put(("album", key, info["album"]))
+                if info.get("art"):
+                    im = self._to_art(info["art"])
+                    if im is not None:
+                        self.events.put(("art", key, im))
+            if path:
+                self.meta_msg(self.meta_result_text(self.submit_meta(path, info)))
+        threading.Thread(target=run, daemon=True).start()
+
+    # ---- bulk: fill in missing album / artwork for the selected playlist tracks
+    def pl_fetch_meta(self):
+        sel = self.pl_selected()
+        pid = self.pl_view_id
+        if not sel or not pid:
+            return
+        rows = [(i, self.pl_items[i]) for i in sel if 0 <= i < len(self.pl_items)]
+        self.meta_msg(f"Fetching metadata for {plural(len(rows), 'track')}…")
+
+        def run():
+            done = queued = miss = 0
+            for i, it in rows:
+                a, t, al, _ln, secs = it[:5]
+                try:
+                    res = get_json(f"{BEEFWEB}/playlists/{q(pid)}/items/{i}:1?"
+                                   + urllib.parse.urlencode({"columns": "%path%"}), 8)
+                    path = str((res["playlistItems"]["items"][0]["columns"] or [""])[0])
+                except Exception:
+                    miss += 1
+                    continue
+                need = flac_missing(path) if path.lower().endswith(".flac") else None
+                if need is None or not any(need):
+                    continue                      # not a readable FLAC, or nothing missing
+                info = fetch_online_meta(a, t, secs)
+                if not info:
+                    miss += 1
+                    continue
+                r = self.submit_meta(path, info)
+                if r == "ok":
+                    done += 1
+                elif r in ("queued", "locked"):
+                    queued += 1
+                elif r == "nomutagen":
+                    self.meta_msg(self.meta_result_text(r))
+                    return
+            msg = f"Written metadata for {plural(done, 'track')}"
+            if queued:
+                msg += f" · {queued} in use (will write after the song ends)"
+            if miss:
+                msg += f" · {miss} not found"
+            self.meta_msg(msg + (" — reload info in foobar2000" if done else ""))
+        threading.Thread(target=run, daemon=True).start()
+
+    def asset_worker(self, seq, raw, w, h, cs, darkness, blur, opts):
         try:
-            self.events.put(("assets", seq, build_assets(raw, w, h, cs, darkness, blur)))
+            self.events.put(("assets", seq, build_assets(raw, w, h, cs, darkness, blur, opts)))
         except Exception:
             import traceback
             traceback.print_exc()
@@ -1537,6 +2330,9 @@ class App:
             kind = ev[0]
             if kind == "lyrics" and ev[1] == self.track_key:
                 self.set_lines(ev[2], ev[3])
+            elif kind == "album" and ev[1] == self.track_key:
+                self.track = (self.track[0], self.track[1], ev[2])
+                self.static_dirty = True
             elif kind == "art" and ev[1] == self.track_key:
                 self.art_raw = ev[2]
                 self.art_ver += 1
@@ -1549,6 +2345,15 @@ class App:
                 self.pl_fetch_pending = False
             elif kind == "upnext" and ev[1] == self.next_sig:
                 self.up_next = ev[2]
+            elif kind == "plart":
+                self.pl_art_pending.discard(ev[1])
+                if ev[2] is None:
+                    self.pl_art_fail[ev[1]] = time.perf_counter()
+                else:
+                    if len(self.pl_art) > 600:
+                        for k in list(self.pl_art)[:150]:
+                            del self.pl_art[k]
+                    self.pl_art[ev[1]] = ev[2]
             elif kind == "toast":
                 self.toast(ev[1], 3.2)
             elif kind == "call":
@@ -1560,14 +2365,6 @@ class App:
             elif kind == "quit":
                 self.close()
                 return
-            elif kind == "show_app":
-                self.root.deiconify()
-                self.root.lift()
-                self.root.focus_force()
-            elif kind == "tray_missing":
-                SETTINGS["foobar_to_tray"] = False
-                self.static_dirty = True
-                self.toast("Tray needs:  pip install pystray", 5)
             elif kind == "job_done":
                 self.jobs_pending = max(0, self.jobs_pending - 1)
             elif kind == "resync":
@@ -1580,6 +2377,7 @@ class App:
         self.times = [ln[0] for ln in lines]
         self.focus = [0.0] * len(lines)
         self.lines_ver += 1
+        self.synced = is_synced(lines)
         self.lyric_state = "found" if lines else "none"
         self.lyr_alpha = 0.0
         self.current = -1
@@ -1587,8 +2385,14 @@ class App:
             self.layout_lines()
             self.scroll = self.target_scroll = self.center_of(0) if lines else 0.0
 
-    def refetch_lyrics(self):
+    def refetch_lyrics(self, ask=True):
         if self.track_key is None:
+            return
+        if ask and self.lyric_source == "Manual":
+            self.confirm("Search online again?",
+                         "The lyrics you added manually for this track will be discarded "
+                         "and searched for online again.",
+                         lambda: self.refetch_lyrics(ask=False), "Search")
             return
         try:
             CACHE.drop_lines(self.track_key)
@@ -1602,6 +2406,96 @@ class App:
         self.toast("Searching lyrics again…")
         threading.Thread(target=self.lyrics_worker,
                          args=(self.track_key, self.duration, True), daemon=True).start()
+
+    # ---- manual lyrics (saved to the cache like any other source)
+    def apply_manual_lyrics(self, text):
+        key = self.track_key
+        if not key:
+            self.toast("Nothing is playing")
+            return
+        lines = lines_from_text(text[:300000])
+        if not lines:
+            self.toast("No lyrics found in that text")
+            return
+
+        def apply():
+            if key != self.track_key:
+                self.toast("The track changed — lyrics not saved")
+                return
+            CACHE.put(key, lines, "Manual")
+            self.set_lines(lines, "Manual")
+            n = sum(1 for ln in lines if ln[1])
+            self.toast(f"Saved {plural(n, 'line')} of "
+                       f"{'synced' if is_synced(lines) else 'unsynced'} lyrics")
+        if self.lines:
+            self.confirm("Replace current lyrics?",
+                         f"The lyrics shown for “{key[1] or 'this track'}” will be replaced "
+                         "and the new ones saved to the cache.", apply, "Replace", danger=False)
+        else:
+            apply()
+
+    def paste_lyrics(self):
+        if not self.track_key:
+            self.toast("Nothing is playing")
+            return
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            text = ""
+        if not text.strip():
+            self.toast("Clipboard has no text — copy the lyrics first")
+            return
+        self.apply_manual_lyrics(text)
+
+    def load_lyrics_file(self):
+        if not self.track_key:
+            self.toast("Nothing is playing")
+            return
+        was_fs = self.fullscreen
+        try:
+            if was_fs:
+                self.root.attributes("-fullscreen", False)
+            path = filedialog.askopenfilename(
+                parent=self.root, title="Load lyrics for this track",
+                filetypes=[("Lyrics", "*.lrc *.txt"), ("All files", "*.*")])
+        finally:
+            if was_fs:
+                self.root.attributes("-fullscreen", True)
+            self.root.focus_force()
+        if not path:
+            return
+        try:
+            data = Path(path).read_bytes()
+        except Exception as e:
+            self.toast(f"Couldn't read file: {e.__class__.__name__}")
+            return
+        if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+            text = data.decode("utf-16", "replace")
+        else:
+            try:
+                text = data.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                text = data.decode("cp1252", "replace")
+        self.apply_manual_lyrics(text)
+
+    def remove_lyrics(self):
+        if not self.track_key:
+            return
+        CACHE.drop_lines(self.track_key)
+        self.set_lines([], "")
+        self.toast("Lyrics removed for this track")
+
+    def menu_lyrics(self, x=None, y=None):
+        if x is None:
+            g = self.geo
+            x, y = (g["lx"] + 30, g["ay"]) if g else (100, 100)
+        self.open_menu(x, y, [
+            {"label": "Paste from clipboard", "hint": "Ctrl+V", "fn": self.paste_lyrics},
+            {"label": "Load from file…", "fn": self.load_lyrics_file},
+            None,
+            {"label": "Remove lyrics for this track", "fn": self.remove_lyrics,
+             "danger": True, "enabled": bool(self.lines)},
+        ], title="Manual lyrics")
 
     def toggle_translation(self):
         SETTINGS["show_translation"] = not SETTINGS["show_translation"]
@@ -1625,9 +2519,10 @@ class App:
 
     def manage_assets(self, now):
         w, h = self.size
+        opts = self.bg_opts()
         sig = (w, h, self.geo["cs"], self.art_ver,
                round(float(SETTINGS["bg_darkness"]), 2),
-               round(float(SETTINGS["bg_blur"]), 2))
+               round(float(SETTINGS["bg_blur"]), 2), opts["mode"], opts["color"], opts["path"])
         if sig != self.want_sig:
             self.want_sig, self.want_since = sig, now
         if sig != self.built_sig and (self.immediate or now - self.want_since >= 0.25):
@@ -1637,7 +2532,7 @@ class App:
             threading.Thread(
                 target=self.asset_worker, daemon=True,
                 args=(self.asset_seq, self.art_raw, w, h, self.geo["cs"],
-                      SETTINGS["bg_darkness"], SETTINGS["bg_blur"])).start()
+                      SETTINGS["bg_darkness"], SETTINGS["bg_blur"], opts)).start()
 
     def apply_assets(self, a):
         self.bg_pil, self.scrim_pil = a["bg"], a["scrim"]
@@ -1700,6 +2595,7 @@ class App:
         g["f_album"] = F(max(13, int(h * .017)))
         g["f_time"] = F(max(11, int(h * .0145)))
         g["f_lyric"] = F(max(30, int(h * .052)), "bold")
+        g["f_lyric_u"] = F(max(22, int(h * .038)), "bold")     # unsynced (plain text) lyrics
         g["f_trans"] = F(max(18, int(h * .029)))
         g["f_msg"] = F(max(20, int(h * .034)), "bold")
         g["f_pill"] = F(max(12, int(h * .0165)), "bold")
@@ -1752,12 +2648,14 @@ class App:
         ux_list = px + cs - util_r
         ux_help = ux_list - util_r * 2.9
         ux_queue = ux_help - util_r * 2.9
+        ux_stats = ux_queue - util_r * 2.9
         ux_vol = ux_rep + util_r * 3.1
-        vx0, vx1 = ux_vol + util_r * 1.5, ux_queue - util_r * 2.3
+        vx0, vx1 = ux_vol + util_r * 1.5, ux_stats - util_r * 2.3
         util = [("shuffle", ux_shuf), ("repeat", ux_rep), ("mute", ux_vol),
-                ("queue", ux_queue), ("help", ux_help), ("list", ux_list)]
+                ("stats", ux_stats), ("queue", ux_queue), ("help", ux_help), ("list", ux_list)]
 
         lx = half + int(w * .02)
+        hr = max(14, int(h * .021))
         pill_txt = "Follow lyrics"
         pw = g["f_pill"].measure(pill_txt) + int(h * .05)
         ph = int(h * .05)
@@ -1774,7 +2672,8 @@ class App:
             util_pos={n: (x, util_cy) for n, x in util},
             vol=(vx0, vx1, util_cy) if vx1 - vx0 >= 40 else None,
             lx=lx, lw=max(300, w - lx - margin), ay=int(h * .42),
-            pill=(pill_x0, pill_y0, pill_x0 + pw, pill_y0 + ph), pill_txt=pill_txt)
+            pill=(pill_x0, pill_y0, pill_x0 + pw, pill_y0 + ph), pill_txt=pill_txt,
+            heart=(px + cs - hr - 2, info_y + tl / 2, hr), title_w=cs - int(hr * 2.8))
 
         # playlist panel geometry (occupies the lyric column)
         pad = max(16, int(h * .022))
@@ -1816,9 +2715,10 @@ class App:
 
     def layout_lines(self):
         g = self.geo
-        f = g["f_lyric"]
+        synced = self.synced
+        f = g["f_lyric"] if synced else g["f_lyric_u"]
         lh = f.metrics("linespace")
-        gap = int(lh * .55)
+        gap = int(lh * (.55 if synced else .22))
         ft = g["f_trans"]
         tlh = ft.metrics("linespace")
         tgap = int(lh * .12)
@@ -1827,8 +2727,11 @@ class App:
         y = 0
         show_trans = bool(SETTINGS["show_translation"])
         for _, txt, tr in self.lines:
-            rows = wrap(txt or "♪", f, g["lw"])
-            oh = len(rows) * lh
+            if not synced and not txt:
+                rows, oh = [""], int(lh * .55)          # stanza break
+            else:
+                rows = wrap(txt or "♪", f, g["lw"])
+                oh = len(rows) * lh
             trows, th = "", 0
             if show_trans and tr:
                 tr_rows = wrap(tr, ft, g["lw"])
@@ -1839,7 +2742,7 @@ class App:
             self.line_y.append(y)
             self.line_h.append(oh + th)
             y += oh + th + gap
-        g["lh"], g["lgap"], g["tgap"] = lh, gap, tgap
+        g["lh"], g["lgap"], g["tgap"], g["lfont"] = lh, gap, tgap, f
 
     def center_of(self, i):
         return self.line_y[i] + self.line_h[i] / 2
@@ -2210,6 +3113,10 @@ class App:
         self.serial(job)
         self.toast("Queue shuffled")
 
+    def toggle_playlist_artwork(self):
+        SETTINGS["playlist_artwork"] = v = not SETTINGS["playlist_artwork"]
+        self.toast("Playlist artwork on" if v else "Playlist artwork off")
+
     def toggle_queue_repeat(self):
         SETTINGS["queue_repeat"] = v = not SETTINGS["queue_repeat"]
         self.toast("Queue repeat on" if v else "Queue repeat off")
@@ -2417,6 +3324,8 @@ class App:
              "enabled": bool(pl) and int(pl.get("index", 0)) < len(self.playlists) - 1},
             {"label": "Select in foobar2000", "fn": lambda: self.pl_activate(pid), "enabled": bool(pl)},
             {"label": "Refresh", "hint": "F5", "fn": self.pl_request_items},
+            {"label": "Show artwork", "checked": bool(SETTINGS["playlist_artwork"]), "keep": True,
+             "fn": self.toggle_playlist_artwork},
         ]
         items += [{"label": f"Queue ({len(self.queue_items)})", "sub": True,
                    "fn": lambda: self.menu_queue(x, y)}]
@@ -2460,6 +3369,7 @@ class App:
                  {"label": "New playlist…", "fn": self.pl_copy_new}, None] + [
                  {"label": p.get("title", "?"), "fn": (lambda d=p.get("id"): self.pl_copy_to(d))}
                  for p in others[:30]], title=f"Copy {plural(n, 'track')} to")},
+            {"label": "Fetch missing album / artwork", "fn": self.pl_fetch_meta},
             {"label": "Keep only selected", "fn": self.pl_crop_selected,
              "enabled": n < len(self.pl_items)},
             {"label": "Select all", "hint": "Ctrl+A", "fn": self.pl_select_all},
@@ -2474,7 +3384,15 @@ class App:
         items = [
             {"label": "Hide playlists" if self.pl_open else "Show playlists", "hint": "P",
              "fn": self.toggle_playlist},
+            {"label": ("Unlike this song" if self.track_key and LIB.is_liked(*self.track[:2])
+                       else "Like this song"), "hint": "L", "fn": self.toggle_like,
+             "enabled": self.track_key is not None},
+            {"label": "Liked songs", "hint": "⇧L", "fn": lambda: self.toggle_library("liked")},
+            {"label": "Statistics", "hint": "T", "fn": lambda: self.toggle_library("stats")},
             {"label": "Search lyrics again", "hint": "R", "fn": self.refetch_lyrics},
+            {"label": "Fetch album / artwork (this track)", "fn": self.fetch_current_meta},
+            {"label": "Manual lyrics", "sub": True, "hint": "E",
+             "fn": lambda: self.menu_lyrics(x, y)},
             {"label": "Show translation", "hint": "V", "checked": bool(SETTINGS["show_translation"]),
              "fn": self.toggle_translation},
             {"label": "Reset lyric offset", "hint": "\\", "fn": lambda: self.adjust_offset(None),
@@ -2969,13 +3887,47 @@ class App:
         self.menu = None
         if self.settings_open:
             self.settings_sel = 0
+            self.settings_page = "main"
+
+    def settings_rows(self):
+        return {"debug": DEBUG_ROWS, "background": BG_ROWS}.get(self.settings_page, SETTINGS_ROWS)
+
+    def settings_goto(self, page):
+        prev = self.settings_page
+        self.settings_page = page
+        self.settings_lay = None
+        if page == "debug":
+            self.meta_cache_n = meta_cache_size()
+        if page != "main":
+            self.settings_sel = 1
+        else:
+            self.settings_sel = next((i for i, r in enumerate(SETTINGS_ROWS)
+                                      if r[2] == "page" and r[3] == prev), 0)
+
+    def settings_activate(self, spec, direction=+1):
+        kind = spec[2]
+        if self.row_disabled(spec[0]):
+            return
+        if kind == "page":
+            self.settings_goto(spec[3])
+        elif kind == "action":
+            if spec[0] == "meta_clear_cache":
+                n = clear_meta_cache()
+                self.meta_cache_n = 0
+                self.meta_msg(f"Cleared {plural(n, 'fetched track')} from the metadata cache")
+        elif kind == "color":
+            self.edit_bg_color()
+        elif kind == "image":
+            self.pick_bg_image()
+        else:
+            self.change_setting(spec[0], spec, direction)
 
     def settings_layout(self):
         g = self.geo
         if not g:
             return None
         W, H = g["w"], g["h"]
-        n = len(SETTINGS_ROWS)
+        n = len(self.settings_rows())
         min_row = 26
         row_h = min(46, max(min_row, int(H * .04)))
         top_pad, title_h = 34, 50
@@ -2991,7 +3943,7 @@ class App:
         px0 = (W - pw) // 2
         py0 = (H - ph) // 2
         rows = []
-        for i, spec in enumerate(SETTINGS_ROWS):
+        for i, spec in enumerate(self.settings_rows()):
             ry = py0 + top_pad + title_h + i * row_h
             rows.append({"key": spec[0], "spec": spec, "y": ry, "h": row_h,
                          "cy": ry + row_h // 2, "label_x": px0 + 32,
@@ -3025,9 +3977,10 @@ class App:
                         lift=1.3, veil=.32)
         c.create_image(px0, py0, image=gl["img"], anchor="nw", tags="dyn")
         base = gl["avg"]
-        c.create_text(px0 + 32, lay["title_y"], text="Settings", anchor="w",
+        c.create_text(px0 + 32, lay["title_y"],
+                      text=PAGE_TITLES.get(self.settings_page, "Settings"), anchor="w",
                       font=g["f_set_title"], fill="#ffffff", tags="dyn")
-        c.create_text(px0 + pw - 32, lay["title_y"], text="↑↓ choose · ←→ change · Esc close",
+        c.create_text(px0 + pw - 32, lay["title_y"], text="↑↓ choose · ←→ change · Esc " + ("back" if self.settings_page != "main" else "close"),
                       anchor="e", font=g["f_hint"], fill=hexc(mix(base, WHITE, .45)), tags="dyn")
         off_col = hexc(mix(base, WHITE, .14))
         for i, row in enumerate(lay["rows"]):
@@ -3037,11 +3990,14 @@ class App:
             if sel:
                 self.rrect(px0 + 14, row["y"] + 2, px0 + pw - 14, row["y"] + row["h"] - 2, 10,
                            fill=hexc(mix(base, WHITE, .08)), outline="", tags="dyn")
+            dis = self.row_disabled(key)
             c.create_text(row["label_x"], row["cy"], text=label, anchor="w", font=g["f_set"],
-                          fill="#ffffff" if sel else hexc(mix(base, WHITE, .75)), tags="dyn")
-            val = SETTINGS[key]
+                          fill=hexc(mix(base, WHITE, .28)) if dis else
+                          ("#ffffff" if sel else hexc(mix(base, WHITE, .75))), tags="dyn")
+            val = SETTINGS[key] if kind in ("toggle", "slider", "choice") else None
             cx0, cx1, cy = row["ctrl_x0"], row["ctrl_x1"], row["cy"]
-            arrow = hexc(mix(base, WHITE, .5))
+            fg = hexc(mix(base, WHITE, .30)) if dis else "#ffffff"
+            arrow = hexc(mix(base, WHITE, .22 if dis else .5))
             if kind == "toggle":
                 th = min(26, row["h"] - 8)
                 tw = th * 2
@@ -3052,17 +4008,38 @@ class App:
                 kx = tx + tw - th / 2 if on else tx + th / 2
                 c.create_oval(kx - th / 2 + 3, ty + 3, kx + th / 2 - 3, ty + th - 3,
                               fill="#ffffff", outline="", tags="dyn")
+            elif kind == "page":
+                if spec[3] != "main":
+                    c.create_text(cx1 - 6, cy, text="›", anchor="e", font=g["f_set_val"],
+                                  fill="#ffffff", tags="dyn")
+            elif kind == "action":
+                c.create_text(cx1 - 6, cy, text=f"Clear ({self.meta_cache_n})", anchor="e",
+                              font=g["f_set_val"], fill="#ffffff", tags="dyn")
+            elif kind == "color":
+                rgb = tuple(int(v) for v in (SETTINGS["bg_color"] or (24, 24, 36))[:3])
+                txt = f"{rgb[0]}, {rgb[1]}, {rgb[2]}"
+                c.create_text(cx1 - 6, cy, text=txt, anchor="e", font=g["f_set_val"], fill=fg,
+                              tags="dyn")
+                sh_ = min(24, row["h"] - 10)
+                sx1 = cx1 - 18 - g["f_set_val"].measure(txt)
+                self.rrect(sx1 - sh_ * 1.6, cy - sh_ / 2, sx1, cy + sh_ / 2, 6,
+                           fill=hexc(mix(rgb, base, .6) if dis else rgb),
+                           outline=hexc(mix(base, WHITE, .35)), tags="dyn")
+            elif kind == "image":
+                name = SETTINGS["bg_image_name"] if self.bg_image_ok() else "Choose…"
+                c.create_text(cx1 - 6, cy, text=self.ell(name, g["f_set_val"], cx1 - cx0 - 10),
+                              anchor="e", font=g["f_set_val"], fill=fg, tags="dyn")
             elif kind == "choice":
                 self._tri(cx0 + 14, cy, 7, "left", arrow)
                 self._tri(cx1 - 14, cy, 7, "right", arrow)
-                c.create_text((cx0 + cx1) / 2, cy, text=str(val), font=g["f_set_val"],
-                              fill="#ffffff", tags="dyn")
+                c.create_text((cx0 + cx1) / 2, cy, text=CHOICE_LABELS.get(str(val), str(val)),
+                              font=g["f_set_val"], fill=fg, tags="dyn")
             elif kind == "slider":
                 _, _, _, lo, hi, step, unit = spec
                 self._tri(cx0 + 14, cy, 7, "left", arrow)
                 self._tri(cx1 - 14, cy, 7, "right", arrow)
                 c.create_text((cx0 + cx1) / 2, cy - 3, text=f"{float(val):g}{unit}",
-                              font=g["f_set_val"], fill="#ffffff", tags="dyn")
+                              font=g["f_set_val"], fill=fg, tags="dyn")
                 tx0, tx1 = cx0 + 40, cx1 - 40
                 ly = cy + row["h"] * .32
                 c.create_line(tx0, ly, tx1, ly, width=3, capstyle="round", fill=off_col,
@@ -3070,7 +4047,8 @@ class App:
                 frac = (float(val) - lo) / max(1e-6, hi - lo)
                 xf = tx0 + (tx1 - tx0) * max(0.0, min(1.0, frac))
                 c.create_line(tx0, ly, max(tx0 + .1, xf), ly, width=3, capstyle="round",
-                              fill=hexc(self.accent), tags="dyn")
+                              fill=hexc(mix(base, WHITE, .26)) if dis else hexc(self.accent),
+                              tags="dyn")
         hov = self.settings_button_hover()
         for name, box, label in (("reset", lay["reset"], "Reset to defaults"),
                                  ("clear", lay["clear"], f"Clear cache ({CACHE.size()})")):
@@ -3080,7 +4058,7 @@ class App:
             c.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=label, font=g["f_set"],
                           fill="#eeeef6", tags="dyn")
         loc = SETTINGS["storage_location"]
-        c.create_text(px0 + pw / 2, lay["info_y"], text=f"{loc}: {shorten_path(CACHE.path, 60)}",
+        c.create_text(px0 + pw / 2, lay["info_y"], text=f"{loc}: {shorten_path(DATA_DIR, 60)}",
                       font=g["f_hint"], fill=hexc(mix(base, WHITE, .4)), tags="dyn")
 
     def settings_button_hover(self):
@@ -3104,6 +4082,7 @@ class App:
         if hov == "reset":
             SETTINGS.reset()
             migrate_storage(SETTINGS["storage_location"])
+            prune_bg_images()
             self.settings_apply_all()
             self.toast("Settings reset to defaults")
             return
@@ -3117,12 +4096,85 @@ class App:
                 self.settings_sel = i
                 spec = row["spec"]
                 key, kind = spec[0], spec[2]
-                if kind == "toggle":
-                    self.change_setting(key, spec, +1)
+                if kind in ("toggle", "page", "action", "color", "image"):
+                    self.settings_activate(spec, +1)
+                elif self.row_disabled(key):
+                    pass
                 else:
                     mid = (row["ctrl_x0"] + row["ctrl_x1"]) / 2
                     self.change_setting(key, spec, -1 if x < mid else +1)
                 return
+
+    # ---- background settings
+    @staticmethod
+    def row_disabled(key):
+        m = SETTINGS["bg_mode"]
+        if key in ("bg_darkness", "bg_blur"):
+            return m == "color"
+        if key == "bg_color":
+            return m != "color"
+        if key == "bg_image":
+            return m != "image"
+        return False
+
+    @staticmethod
+    def bg_image_ok():
+        n = SETTINGS["bg_image"]
+        return bool(n) and (BG_DIR / n).is_file()
+
+    def bg_opts(self):
+        col = SETTINGS["bg_color"]
+        try:
+            col = tuple(max(0, min(255, int(v))) for v in col[:3])
+            assert len(col) == 3
+        except Exception:
+            col = (24, 24, 36)
+        path = str(BG_DIR / SETTINGS["bg_image"]) if self.bg_image_ok() else ""
+        return {"mode": SETTINGS["bg_mode"], "color": col, "path": path}
+
+    def edit_bg_color(self):
+        def ok(txt):
+            col = parse_color(txt)
+            if col is None:
+                self.toast("Couldn't read that colour — try 24, 24, 36 or #181824")
+                return
+            SETTINGS["bg_color"] = list(col)
+            self.apply_setting("bg_color")
+        self.prompt("Background colour — R, G, B or #hex",
+                    ", ".join(str(int(v)) for v in self.bg_opts()["color"]), ok,
+                    ok_label="Apply", placeholder="e.g. 24, 24, 36")
+
+    def pick_bg_image(self):
+        was_fs = self.fullscreen
+        try:
+            if was_fs:
+                self.root.attributes("-fullscreen", False)
+            path = filedialog.askopenfilename(
+                parent=self.root, title="Choose a background image",
+                filetypes=[("Images", "*.png *.jpg *.jpeg *.bmp *.gif *.webp"), ("All files", "*.*")])
+        finally:
+            if was_fs:
+                self.root.attributes("-fullscreen", True)
+            self.root.focus_force()
+        if not path:
+            return
+        try:
+            with Image.open(path) as im:
+                im.verify()
+            BG_DIR.mkdir(parents=True, exist_ok=True)
+            name = (f"bg_{time.strftime('%Y%m%d_%H%M%S')}_{random.randrange(16 ** 4):04x}"
+                    f"{Path(path).suffix.lower() or '.png'}")
+            shutil.copyfile(path, BG_DIR / name)
+        except Exception:
+            self.toast("Couldn't use that image")
+            return
+        SETTINGS.set("bg_image", name, save=False)
+        SETTINGS.set("bg_image_name", Path(path).name, save=False)
+        SETTINGS.set("bg_mode", "image")
+        prune_bg_images()
+        self.immediate = True
+        self.static_dirty = True
+        self.toast("Background image saved")
 
     def settings_apply_all(self):
         self.geo = None
@@ -3131,6 +4183,8 @@ class App:
 
     def change_setting(self, key, spec, direction):
         kind = spec[2]
+        if self.row_disabled(key):
+            return
         if kind == "toggle":
             SETTINGS[key] = not bool(SETTINGS[key])
         elif kind == "slider":
@@ -3150,43 +4204,385 @@ class App:
             self.toast(f"Data moved to {SETTINGS['storage_location']}")
         if key == "font_scale":
             self.geo = None
-        if key in ("bg_darkness", "bg_blur"):
+        if key in ("bg_darkness", "bg_blur", "bg_mode", "bg_color", "bg_image"):
             self.built_sig = None
             self.immediate = True
-        if key == "foobar_to_tray" and SETTINGS[key]:
-            if IS_WIN:
-                self.toast("Minimizing foobar2000 now sends it to the tray")
-            else:
-                SETTINGS[key] = False
-                self.toast("Tray option is Windows only")
+        if key == "bg_mode" and SETTINGS["bg_mode"] == "image" and not self.bg_image_ok():
+            self.pick_bg_image()
+            if not self.bg_image_ok():               # cancelled: don't stay on an empty choice
+                SETTINGS["bg_mode"] = "artwork"
         if key == "show_translation" and self.geo and self.lines:
             self.layout_lines()
-        if key == "lyric_source":
-            self.refetch_lyrics()
+        if key == "lyric_source" and self.lyric_source != "Manual":
+            self.refetch_lyrics(ask=False)
+        if (key == "genius_fallback" and self.lyric_source != "Manual"
+                and (self.lyric_state == "none" or (self.lines and not self.synced))):
+            self.refetch_lyrics(ask=False)
         self.static_dirty = True
 
     def settings_key(self, k):
+        rows = self.settings_rows()
         if k in ("Escape", "s"):
-            self.settings_open = False
+            if self.settings_page != "main":
+                self.settings_goto("main")
+            else:
+                self.settings_open = False
         elif k == "Up":
-            self.settings_sel = (self.settings_sel - 1) % len(SETTINGS_ROWS)
+            self.settings_sel = (self.settings_sel - 1) % len(rows)
         elif k == "Down":
-            self.settings_sel = (self.settings_sel + 1) % len(SETTINGS_ROWS)
+            self.settings_sel = (self.settings_sel + 1) % len(rows)
         elif k in ("Left", "Right"):
-            spec = SETTINGS_ROWS[self.settings_sel]
-            self.change_setting(spec[0], spec, -1 if k == "Left" else +1)
+            spec = rows[self.settings_sel]
+            if spec[2] in ("toggle", "slider", "choice"):
+                self.change_setting(spec[0], spec, -1 if k == "Left" else +1)
         elif k in ("space", "Return", "KP_Enter"):
-            spec = SETTINGS_ROWS[self.settings_sel]
-            if spec[2] == "toggle":
-                self.change_setting(spec[0], spec, +1)
+            self.settings_activate(rows[self.settings_sel], +1)
         elif k in ("question", "F1"):
             self.settings_open = False
             self.help_open = True
         return True
 
+    # ============================================================ LIBRARY
+    def toggle_like(self):
+        if not self.track_key:
+            self.toast("Nothing is playing")
+            return
+        a, t, al = self.track
+        on = LIB.toggle_like(a, t, al)
+        self.like_pop = (time.perf_counter(), 1 if on else -1)
+        self.toast("Added to Liked songs" if on else "Removed from Liked songs")
+
+    def toggle_library(self, tab=None):
+        if self.lib_open and (tab is None or tab == self.lib_tab):
+            self.lib_open = False
+            return
+        self.lib_open, self.menu = True, None
+        self.settings_open = self.help_open = False
+        self.lib_set_tab(tab or self.lib_tab)
+
+    def lib_set_tab(self, tab):
+        self.lib_tab = tab
+        self.lib_scroll = self.lib_target = 0.0
+        self.lib_sel = 0
+
+    def lib_unlike(self, key):
+        if self.track_key and key == Library.tid(self.track[0], self.track[1]):
+            self.like_pop = (time.perf_counter(), -1)
+        LIB.unlike(key)
+        self.toast("Removed from Liked songs")
+
+    def play_liked(self, e):
+        """Find the song in any foobar2000 playlist and play it."""
+        want = Library.tid(e.get("a", ""), e.get("t", ""))
+        pls = sorted((p.get("id") for p in self.playlists),
+                     key=lambda i: (i != self.play_pl_id, i != self.pl_view_id))
+        if not self.connected:
+            self.toast("Not connected to foobar2000")
+            return
+        self.toast("Looking for the song…")
+
+        def run():
+            for pid in pls:
+                off = 0
+                try:
+                    while True:
+                        res = get_json(f"{BEEFWEB}/playlists/{q(pid)}/items/{off}:4000?"
+                                       + urllib.parse.urlencode({"columns": "%artist%,%title%"}),
+                                       10).get("playlistItems") or {}
+                        items = res.get("items") or []
+                        for i, it in enumerate(items):
+                            c = (it.get("columns") or []) + ["", ""]
+                            if Library.tid(str(c[0]), str(c[1])) == want:
+                                post_json(BEEFWEB + f"/player/play/{q(pid)}/{off + i}")
+                                self.events.put(("toast", "Playing “" + e.get("t", "") + "”"))
+                                return
+                        off += len(items)
+                        if not items or off >= int(res.get("totalCount") or 0):
+                            break
+                except Exception:
+                    continue
+            self.events.put(("toast", "Not found in any playlist"))
+        threading.Thread(target=run, daemon=True).start()
+
+    def lib_layout(self):
+        g = self.geo
+        W, H = g["w"], g["h"]
+        pw, ph = int(min(880, W - 80)), int(min(H - 40, H * .88))
+        x0, y0 = (W - pw) // 2, (H - ph) // 2
+        pad = int(max(22, H * .03))
+        th = int(g["f_set"].metrics("linespace") + H * .018)
+        tabs, x = [], x0 + pad
+        for key, label in LIB_TABS:
+            txt = label + (f"  {len(LIB.liked)}" if key == "liked" else "")
+            w = g["f_set_val"].measure(txt) + int(H * .04)
+            tabs.append((key, txt, (x, y0 + pad, x + w, y0 + pad + th)))
+            x += w + 10
+        cy0 = y0 + pad + th + int(H * .022)
+        cy1 = y0 + ph - pad - int(g["f_hint"].metrics("linespace") + H * .02)
+        return {"box": (x0, y0, x0 + pw, y0 + ph), "pad": pad, "tabs": tabs, "th": th,
+                "cy0": cy0, "cy1": cy1, "row_h": max(46, int(H * .058))}
+
+    def lib_hit_at(self, x, y):
+        for (bx0, by0, bx1, by1), kind, v in reversed(self.lib_hits):
+            if bx0 <= x <= bx1 and by0 <= y <= by1:
+                return (kind, v)
+        return None
+
+    def draw_library(self, now):
+        if not self.lib_open:
+            return
+        c, g = self.canvas, self.geo
+        L = self.lib_lay = self.lib_layout()
+        x0, y0, x1, y1 = L["box"]
+        pad, cy0, cy1 = L["pad"], L["cy0"], L["cy1"]
+        gl = self.glass("lib", L["box"], 22, src="scrim", lift=1.3, veil=.32,
+                        strips={"head": (0, cy0 - y0), "foot": (cy1 - y0, y1 - y0)})
+        base = gl["avg"]
+        self.lib_hits = []
+        c.create_image(x0, y0, image=gl["img"], anchor="nw", tags="dyn")
+        if self.lib_tab == "liked":
+            self.draw_lib_liked(L, base)
+        else:
+            self.draw_lib_stats(L, base)
+        if "head" in gl:
+            c.create_image(x0, y0, image=gl["head"], anchor="nw", tags="dyn")
+        if "foot" in gl:
+            c.create_image(x0, cy1, image=gl["foot"], anchor="nw", tags="dyn")
+        hov = self.lib_hit_at(self.mx, self.my)
+        for key, txt, (bx0, by0, bx1, by1) in L["tabs"]:
+            act = key == self.lib_tab
+            fill = mix(base, self.accent, .62) if act else mix(base, WHITE, .15 if hov == ("tab", key) else .07)
+            self.rrect(bx0, by0, bx1, by1, (by1 - by0) / 2, fill=hexc(fill), outline="", tags="dyn")
+            c.create_text((bx0 + bx1) / 2, (by0 + by1) / 2, text=txt, font=g["f_set_val"],
+                          fill="#ffffff" if act else hexc(mix(base, WHITE, .75)), tags="dyn")
+            self.lib_hits.append(((bx0, by0, bx1, by1), "tab", key))
+        dim = hexc(mix(base, WHITE, .42))
+        c.create_text(x1 - pad, L["tabs"][0][2][1] + L["th"] / 2, text="Esc to close", anchor="e",
+                      font=g["f_hint"], fill=dim, tags="dyn")
+        hint = ("↑↓ select · Enter play · Del remove · Tab switch" if self.lib_tab == "liked"
+                else "Tab switch")
+        c.create_text(x0 + pad, y1 - pad * .7, text=hint, anchor="sw", font=g["f_hint"],
+                      fill=dim, tags="dyn")
+
+    def draw_lib_liked(self, L, base):
+        c, g = self.canvas, self.geo
+        x0, y0, x1, y1 = L["box"]
+        pad, cy0, cy1, rh = L["pad"], L["cy0"], L["cy1"], L["row_h"]
+        items = LIB.liked_list()
+        n = len(items)
+        if not items:
+            mid = (x0 + x1) / 2
+            c.create_text(mid, (cy0 + cy1) / 2 - 10, text="No liked songs yet", font=g["f_pl_head"],
+                          fill=hexc(mix(base, WHITE, .6)), tags="dyn")
+            c.create_text(mid, (cy0 + cy1) / 2 + g["f_pl_head"].metrics("linespace"),
+                          text="Press L or click the heart next to the song title",
+                          font=g["f_pl_sub"], fill=hexc(mix(base, WHITE, .4)), tags="dyn")
+            return
+        mx = max(0.0, n * rh - (cy1 - cy0) + 8)
+        self.lib_target = max(0.0, min(mx, self.lib_target))
+        self.lib_scroll += (self.lib_target - self.lib_scroll) * .3
+        if abs(self.lib_target - self.lib_scroll) < .5:
+            self.lib_scroll = self.lib_target
+        self.lib_sel = max(0, min(n - 1, self.lib_sel))
+        hov = self.lib_hit_at(self.mx, self.my)
+        hk = hov[1] if hov and hov[0] in ("row", "unlike") else -1
+        cur = Library.tid(self.track[0], self.track[1]) if self.track_key else None
+        ft, fs, fn = g["f_pl_title"], g["f_pl_sub"], g["f_pl_num"]
+        rx0, rx1 = x0 + pad * .6, x1 - pad * .6
+        first = max(0, int(self.lib_scroll // rh) - 1)
+        last = min(n, int((self.lib_scroll + cy1 - cy0) // rh) + 2)
+        for k in range(first, last):
+            key, e = items[k]
+            top = cy0 + k * rh - self.lib_scroll
+            if k == self.lib_sel:
+                self.rrect(rx0, top + 2, rx1, top + rh - 2, 10, fill=hexc(mix(base, self.accent, .36)),
+                           outline="", tags="dyn")
+            elif k == hk:
+                self.rrect(rx0, top + 2, rx1, top + rh - 2, 10, fill=hexc(mix(base, WHITE, .06)),
+                           outline="", tags="dyn")
+            cy = top + rh / 2
+            hx = rx0 + 26
+            heart = mix(HEART, WHITE, .35) if hov == ("unlike", k) else HEART
+            self.icon_heart(hx, cy, rh * .17, hexc(heart), 1.5, fill=hexc(heart), fs=1.0)
+            tx = hx + rh * .5
+            right = rx1 - 16
+            date = time.strftime("%b %d", time.localtime(float(e.get("ts", 0))))
+            c.create_text(right, cy, text=date, anchor="e", font=fn,
+                          fill=hexc(mix(base, WHITE, .45)), tags="dyn")
+            avail = right - tx - fn.measure("Sep 30") - 20
+            now_playing = key == cur
+            c.create_text(tx, cy + 1, text=self.ell(e.get("t") or "Untitled", ft, avail), anchor="sw",
+                          font=ft, tags="dyn",
+                          fill=hexc(mix(self.accent, WHITE, .4)) if now_playing else "#ffffff")
+            sub = " — ".join(x for x in (e.get("a"), e.get("al")) if x)
+            if sub:
+                c.create_text(tx, cy + 1, text=self.ell(sub, fs, avail), anchor="nw", font=fs,
+                              fill=hexc(mix(base, WHITE, .5)), tags="dyn")
+            by0, by1 = max(top, cy0), min(top + rh, cy1)
+            if by1 > by0:
+                self.lib_hits.append(((rx0, by0, rx1, by1), "row", k))
+                self.lib_hits.append(((rx0, by0, rx0 + 54, by1), "unlike", k))
+        if mx > 0:
+            lh = cy1 - cy0
+            th = max(28, lh * lh / (lh + mx))
+            ty = cy0 + (lh - th) * (self.lib_scroll / mx)
+            c.create_line(x1 - pad * .3, ty + 3, x1 - pad * .3, ty + th - 3, width=4, capstyle="round",
+                          fill=hexc(mix(base, WHITE, .25)), tags="dyn")
+
+    def draw_lib_stats(self, L, base):
+        c, g = self.canvas, self.geo
+        H = g["h"]
+        x0, y0, x1, y1 = L["box"]
+        pad, cy0 = L["pad"], L["cy0"]
+        week = LIB.week()
+        wsec = sum(s for _, s in week)
+        nplays = sum(int(p.get("n", 0)) for p in LIB.plays.values())
+        cw = x1 - x0 - 2 * pad
+        gap = int(H * .016)
+        cwid = (cw - 2 * gap) / 3
+        card_h = int(H * .105)
+        fb = self.font(max(20, int(H * .038)), "bold")
+        dim = hexc(mix(base, WHITE, .5))
+        acc = hexc(mix(self.accent, WHITE, .35))
+        cards = [("THIS WEEK", f"{int(wsec // 60):,}", "min", fmt_long(wsec)),
+                 ("ALL TIME", f"{int(LIB.total // 60):,}", "min", fmt_long(LIB.total)),
+                 ("SONGS PLAYED", f"{nplays:,}", "plays", plural(len(LIB.plays), "different song"))]
+        for i, (lab, val, unit, sub) in enumerate(cards):
+            bx = x0 + pad + i * (cwid + gap)
+            self.rrect(bx, cy0, bx + cwid, cy0 + card_h, 14, fill=hexc(mix(base, WHITE, .07)),
+                       outline="", tags="dyn")
+            c.create_text(bx + 16, cy0 + card_h * .2, text=lab, anchor="w", font=g["f_label"],
+                          fill=acc, tags="dyn")
+            vy = cy0 + card_h * .52
+            c.create_text(bx + 16, vy, text=val, anchor="w", font=fb, fill="#ffffff", tags="dyn")
+            c.create_text(bx + 24 + fb.measure(val), vy + fb.metrics("linespace") * .12, text=unit,
+                          anchor="w", font=g["f_pl_title"], fill=dim, tags="dyn")
+            c.create_text(bx + 16, cy0 + card_h * .84, text=sub, anchor="w", font=g["f_pl_sub"],
+                          fill=dim, tags="dyn")
+        # minutes per day (Mon..Sun)
+        y = cy0 + card_h + gap * 2
+        flh = g["f_label"].metrics("linespace")
+        c.create_text(x0 + pad, y, text="MINUTES PER DAY THIS WEEK", anchor="nw", font=g["f_label"],
+                      fill=acc, tags="dyn")
+        y += flh + int(H * .012)
+        ch = int(H * .13)
+        top_y = y + g["f_pl_num"].metrics("linespace") + 4
+        base_y = top_y + ch
+        mx = max([s for _, s in week] + [60.0])
+        slot = cw / 7
+        bw = min(slot * .5, 54)
+        today = datetime.date.today()
+        for i, (d, s) in enumerate(week):
+            cxm = x0 + pad + slot * (i + .5)
+            bh = max(3.0, ch * s / mx)
+            if d == today:
+                col = mix(base, self.accent, .85)
+            else:
+                col = mix(base, WHITE, .10 if (d > today or s <= 0) else .30)
+            self.rrect(cxm - bw / 2, base_y - bh, cxm + bw / 2, base_y, min(8, bw / 2),
+                       fill=hexc(col), outline="", tags="dyn")
+            if s >= 60:
+                c.create_text(cxm, base_y - bh - 3, text=str(int(s // 60)), anchor="s",
+                              font=g["f_pl_num"], fill=hexc(mix(base, WHITE, .8)), tags="dyn")
+            c.create_text(cxm, base_y + 6, text=d.strftime("%a"), anchor="n", font=g["f_pl_sub"],
+                          fill="#ffffff" if d == today else dim, tags="dyn")
+        # top 5
+        y = base_y + 6 + g["f_pl_sub"].metrics("linespace") + gap * 2
+        c.create_text(x0 + pad, y, text="TOP 5 SONGS", anchor="nw", font=g["f_label"], fill=acc,
+                      tags="dyn")
+        c.create_text(x1 - pad, y, text="a play counts after 80% of the song", anchor="ne",
+                      font=g["f_pl_sub"], fill=dim, tags="dyn")
+        y += flh + int(H * .012)
+        top = LIB.top(5)
+        rh5 = int(H * .046)
+        if not top:
+            c.create_text(x0 + pad, y + rh5 / 2, anchor="w", font=g["f_pl_title"], fill=dim,
+                          text="Nothing yet — listen to a song until 80% to start counting.",
+                          tags="dyn")
+            return
+        mxn = max(int(p.get("n", 0)) for _, p in top)
+        rx0, rx1 = x0 + pad, x1 - pad
+        fb2 = g["f_pl_title_b"]
+        for i, (_, p) in enumerate(top):
+            ry = y + i * rh5
+            n = int(p.get("n", 0))
+            self.rrect(rx0, ry + 2, rx1, ry + rh5 - 2, 10, fill=hexc(mix(base, WHITE, .05)),
+                       outline="", tags="dyn")
+            self.rrect(rx0, ry + 2, rx0 + max(rh5, (rx1 - rx0) * n / mxn), ry + rh5 - 2, 10,
+                       fill=hexc(mix(base, self.accent, .38)), outline="", tags="dyn")
+            cyr = ry + rh5 / 2
+            c.create_text(rx0 + 18, cyr, text=str(i + 1), font=fb2, fill="#ffffff", tags="dyn")
+            avail = (rx1 - rx0) - 170
+            tt = self.ell(p.get("t") or "Untitled", fb2, avail * .62)
+            tw = self.mw(tt, fb2)
+            c.create_text(rx0 + 44, cyr, text=tt, anchor="w", font=fb2, fill="#ffffff", tags="dyn")
+            if p.get("a"):
+                c.create_text(rx0 + 56 + tw, cyr, anchor="w", font=g["f_pl_sub"], tags="dyn",
+                              text=self.ell(p["a"], g["f_pl_sub"], max(20, avail - tw - 12)),
+                              fill=hexc(mix(base, WHITE, .7)))
+            c.create_text(rx1 - 16, cyr, text=plural(n, "play"), anchor="e", font=g["f_pl_title"],
+                          fill="#ffffff", tags="dyn")
+
+    def lib_click(self, x, y):
+        L = self.lib_lay or self.lib_layout()
+        hit = self.lib_hit_at(x, y)
+        if not hit:
+            x0, y0, x1, y1 = L["box"]
+            if not (x0 <= x <= x1 and y0 <= y <= y1):
+                self.lib_open = False
+            return
+        kind, v = hit
+        items = LIB.liked_list()
+        if kind == "tab":
+            self.lib_set_tab(v)
+        elif kind == "row" and v < len(items):
+            self.lib_sel = v
+            self.play_liked(items[v][1])
+        elif kind == "unlike" and v < len(items):
+            self.lib_unlike(items[v][0])
+
+    def lib_key(self, k, ch, ctrl, shift, alt):
+        if k in ("space", "m", "n", "b", "plus", "minus", "equal", "underscore", "KP_Add",
+                 "KP_Subtract") or (k == "l" and not shift and not ctrl):
+            return self.global_key(k, ch, ctrl, shift, alt)
+        if k == "Escape":
+            self.lib_open = False
+        elif k == "Tab":
+            self.lib_set_tab("stats" if self.lib_tab == "liked" else "liked")
+        elif k == "Left":
+            self.lib_set_tab("liked")
+        elif k == "Right":
+            self.lib_set_tab("stats")
+        elif k == "t":
+            self.toggle_library("stats")
+        elif k == "l" and shift:
+            self.toggle_library("liked")
+        elif self.lib_tab == "liked":
+            items = LIB.liked_list()
+            n = len(items)
+            if not n:
+                return True
+            L = self.lib_layout()
+            rh, vh = L["row_h"], L["cy1"] - L["cy0"]
+            page = max(1, vh // rh - 1)
+            if k in ("Up", "Down", "Prior", "Next", "Home", "End"):
+                d = {"Up": -1, "Down": 1, "Prior": -page, "Next": page}.get(k)
+                self.lib_sel = (0 if k == "Home" else n - 1 if k == "End"
+                                else max(0, min(n - 1, self.lib_sel + d)))
+                top = self.lib_sel * rh
+                if top < self.lib_target:
+                    self.lib_target = top
+                elif top + rh > self.lib_target + vh:
+                    self.lib_target = top + rh - vh
+            elif k in ("Return", "KP_Enter"):
+                self.play_liked(items[min(self.lib_sel, n - 1)][1])
+            elif k == "Delete":
+                self.lib_unlike(items[min(self.lib_sel, n - 1)][0])
+        return True
+
     # ---------------------------------------------------------- interaction
     def overlay_open(self):
-        return bool(self.modal or self.help_open or self.settings_open)
+        return bool(self.modal or self.help_open or self.settings_open or self.lib_open)
 
     def pl_live(self):
         return self.pl_open and self.pl_anim > .97
@@ -3195,6 +4591,10 @@ class App:
         g = self.geo
         if not g or x < 0:
             return None
+        if self.track_key is not None:
+            hx, hy, hr = g["heart"]
+            if (x - hx) ** 2 + (y - hy) ** 2 <= (hr * 1.5) ** 2:
+                return ("like", None)
         if self.ui_alpha > .25 or self.dragging or self.vol_dragging:
             for name, cx, cy, r in g["buttons"]:
                 if (x - cx) ** 2 + (y - cy) ** 2 <= r * r:
@@ -3216,11 +4616,11 @@ class App:
                 return h
         elif self.pl_open:
             return None
-        if not self.auto_follow and self.lines:
+        if not self.auto_follow and self.lines and self.synced:
             x0, y0, x1, y1 = g["pill"]
             if x0 <= x <= x1 and y0 <= y <= y1:
                 return ("pill", None)
-        if self.lines and x >= g["lx"] - 40:
+        if self.lines and self.synced and x >= g["lx"] - 40:
             gap = g["lgap"]
             for i in range(len(self.lines)):
                 top = g["ay"] + self.line_y[i] - self.scroll
@@ -3290,6 +4690,9 @@ class App:
         if self.help_open:
             self.help_open = False
             return
+        if self.lib_open:
+            self.lib_click(e.x, e.y)
+            return
         if self.settings_open:
             self.settings_click(e.x, e.y)
             return
@@ -3305,6 +4708,8 @@ class App:
         elif kind == "vol":
             self.vol_dragging = True
             self.set_volume_frac(self.vol_bar_frac(e.x))
+        elif kind == "like":
+            self.toggle_like()
         elif kind == "pill":
             self.follow_now()
         elif kind == "line":
@@ -3324,7 +4729,8 @@ class App:
         elif kind == "util":
             {"shuffle": self.toggle_shuffle, "repeat": self.cycle_repeat,
              "mute": self.toggle_mute, "help": self.toggle_help, "queue": self.menu_queue,
-             "list": self.toggle_playlist}[val]()
+             "list": self.toggle_playlist,
+             "stats": self.toggle_library}[val]()
         elif kind == "plbtn":
             _, cx, cy, r = next(b for b in self.geo["pl"]["hbtns"] if b[0] == val)
             if val == "add":
@@ -3419,7 +4825,7 @@ class App:
 
     def on_right(self, e):
         self.mx, self.my = e.x, e.y
-        if self.modal or self.help_open or self.settings_open:
+        if self.modal or self.help_open or self.settings_open or self.lib_open:
             return
         if self.menu:
             self.menu = None
@@ -3447,6 +4853,10 @@ class App:
         if e is not None:
             self.mx, self.my = e.x, e.y
         self.last_move = time.perf_counter()
+        if self.lib_open and not (self.modal or self.menu) and self.geo and delta:
+            if self.lib_tab == "liked":
+                self.lib_target += (-1 if delta > 0 else 1) * self.lib_layout()["row_h"] * 2
+            return
         if self.overlay_open() or self.menu or not self.geo or not delta:
             return
         g = self.geo
@@ -3514,6 +4924,8 @@ class App:
             return True
         if self.settings_open:
             return self.settings_key(k)
+        if self.lib_open:
+            return self.lib_key(k, ch, ctrl, shift, alt)
         if k == "q" and shift and not ctrl and not (self.pl_open and self.pl_filter_active):
             self.menu_queue()
             return True
@@ -3658,6 +5070,10 @@ class App:
             self.toggle_stop_after() if shift else self.stop()
         elif ctrl and k == "s":
             self.toggle_shuffle()
+        elif ctrl and k == "v":
+            self.paste_lyrics()
+        elif k == "e" and not ctrl:
+            self.menu_lyrics()
         elif ctrl and k == "r":
             self.cycle_repeat()
         elif k == "o" and not ctrl:
@@ -3665,8 +5081,12 @@ class App:
         elif len(k) == 1 and k.isdigit() and not ctrl:
             if self.duration > 0:
                 self.seek_to(self.duration * int(k) / 10)
-        elif k in ("p", "l") and not ctrl:
+        elif k == "p" and not ctrl:
             self.toggle_playlist()
+        elif k == "l" and not ctrl:
+            self.toggle_library("liked") if shift else self.toggle_like()
+        elif k == "t" and not ctrl:
+            self.toggle_library("stats")
         elif k == "s" and not ctrl:
             self.toggle_settings()
         elif k == "r" and not ctrl:
@@ -3715,9 +5135,9 @@ class App:
                 t, a, al = "Nothing playing", "Press play in foobar2000", ""
             else:
                 t, a, al = "Waiting for foobar2000…", "Is Beefweb running on port 8880?", ""
-        rows = wrap(t or "Unknown title", g["f_title"], g["cs"])
+        rows = wrap(t or "Unknown title", g["f_title"], g["title_w"])
         if len(rows) > 2:
-            rows = [rows[0], ellipsize(" ".join(rows[1:]), g["f_title"], g["cs"])]
+            rows = [rows[0], ellipsize(" ".join(rows[1:]), g["f_title"], g["title_w"])]
         y = g["info_y"]
         c.create_text(g["px"], y, text="\n".join(rows), anchor="nw", font=g["f_title"],
                       fill="#ffffff", justify="left", tags="static")
@@ -3732,14 +5152,15 @@ class App:
 
     def update_lyrics(self, pos, dt):
         lead = float(SETTINGS["lyric_lead"]) + self.lyr_offset
-        idx = bisect.bisect_right(self.times, pos + lead) - 1 if self.times else -1
+        idx = (bisect.bisect_right(self.times, pos + lead) - 1
+               if self.times and self.synced else -1)
         self.current = idx
         k = 1 - math.exp(-dt * 10)
         for i, f in enumerate(self.focus):
             tgt = 1.0 if i == idx else 0.0
             if abs(tgt - f) > .002:
                 self.focus[i] = f + (tgt - f) * k
-        if self.auto_follow and self.lines:
+        if self.auto_follow and self.lines and self.synced:
             self.target_scroll = self.center_of(max(0, idx))
         self.scroll += (self.target_scroll - self.scroll) * (1 - math.exp(-dt * 7))
         if abs(self.target_scroll - self.scroll) < .3:
@@ -3757,29 +5178,30 @@ class App:
                 msg = ""
             else:
                 msg = {"loading": "Searching for lyrics…",
-                       "none": "No synced lyrics found for this track"}.get(self.lyric_state, "")
+                       "none": "No lyrics found for this track"}.get(self.lyric_state, "")
             if msg:
                 c.create_text(lx, ay, text=msg, anchor="w", font=g["f_msg"],
                               fill=hexc(mix(tint, WHITE, .5 * vis)), tags="dyn")
                 if self.lyric_state == "none":
                     c.create_text(lx, ay + g["f_msg"].metrics("linespace") * 1.3,
-                                  text="Press R to try again · P for playlists · ? for shortcuts",
+                                  text="R try again · E add lyrics manually · P playlists · ? shortcuts",
                                   anchor="w", font=g["f_hint"],
                                   fill=hexc(mix(tint, WHITE, .3 * vis)), tags="dyn")
             return
         base = mix(tint, WHITE, .44)
+        synced = self.synced
         for i in range(len(self.lines)):
             top = ay + self.line_y[i] - self.scroll
             bot = top + self.line_h[i]
             if bot < -40 or top > h + 40:
                 continue
             dist = abs((top + bot) / 2 - ay)
-            fade = max(.05, 1 - (dist / (h * .6)) ** 2) * self.lyr_alpha * vis
-            f = self.focus[i]
+            fade = max(.05, 1 - (dist / (h * (.6 if synced else .95))) ** 2) * self.lyr_alpha * vis
+            f = self.focus[i] if synced else .62      # unsynced: no current line, all equal
             if i == self.hover_line and i != self.current:
                 f = max(f, .35)
             col = mix(tint, mix(base, WHITE, f), .12 + .88 * fade)
-            c.create_text(lx, top, text=self.line_rows[i], anchor="nw", font=g["f_lyric"],
+            c.create_text(lx, top, text=self.line_rows[i], anchor="nw", font=g["lfont"],
                           fill=hexc(col), justify="left", tags="dyn")
             if self.line_trows[i]:
                 tcol = mix(tint, mix(tint, WHITE, .30 + .45 * f), .12 + .88 * fade)
@@ -3787,75 +5209,250 @@ class App:
                               anchor="nw", font=g["f_trans"], fill=hexc(tcol),
                               justify="left", tags="dyn")
 
-    # ---- icons
+    # ---- icons: drawn 8x larger with PIL and scaled down, so edges are smooth
+    AA = 8
+
+    @staticmethod
+    def _rgb(col):
+        col = col.lstrip("#")
+        return tuple(int(col[i:i + 2], 16) // 4 * 4 for i in (0, 2, 4))
+
+    def _aa_mask(self, key, w, h, draw):
+        masks = self.__dict__.setdefault("_aa_masks", {})
+        m = masks.get(key)
+        if m is None:
+            if len(masks) > 800:
+                masks.clear()
+            S = self.AA
+            big = Image.new("L", (w * S, h * S), 0)
+            draw(ImageDraw.Draw(big), S)
+            m = masks[key] = big.resize((w, h), Image.LANCZOS)
+        return m
+
+    def _aa_photo(self, key, mask, col):
+        cur = self.__dict__.setdefault("_aa_cur", {})
+        old = self.__dict__.setdefault("_aa_old", {})
+        rgb = self._rgb(col)
+        ck = (key, rgb)
+        ph = cur.get(ck) or old.get(ck)
+        if ph is None:
+            im = Image.new("RGBA", mask.size, rgb + (0,))
+            im.putalpha(mask)
+            ph = ImageTk.PhotoImage(im)
+        cur[ck] = ph
+        return ph
+
+    def aa_blit(self, key, half, cx, cy, col, paint):
+        """Draw an anti-aliased glyph centred on (cx, cy). `paint(d, P)` draws it in white
+        on a transparent mask; P maps pixel offsets from the centre to supersampled coords."""
+        half = int(half)
+        k = (key, half)
+        c0 = half
+
+        def draw(d, S):
+            paint(d, lambda x, y: (c0 * S + x * S, c0 * S + y * S))
+        m = self._aa_mask(k, half * 2, half * 2, draw)
+        self.canvas.create_image(cx, cy, image=self._aa_photo(k, m, col), anchor="center",
+                                 tags="dyn")
+
+    def aa_capsule(self, x0, x1, y, th, col):
+        """Smooth horizontal bar with round ends (what create_line(capstyle=round) drew jagged)."""
+        r = round(th * 2) / 4.0
+        Lq = round(max(0.0, x1 - x0) * 2) / 2
+        left, top = math.floor(x0 - r) - 2, math.floor(y - r) - 2
+        fx = round((x0 - r - left) * 4) / 4          # sub-pixel position inside the mask
+        fy = round((y - r - top) * 4) / 4
+        W = int(math.ceil(Lq + 2 * r + fx)) + 3
+        H = int(math.ceil(2 * r + fy)) + 3
+        k = ("cap", Lq, r, fx, fy)
+
+        def draw(d, S):
+            xa, ya = fx * S, fy * S
+            xb, yb = xa + (Lq + 2 * r) * S, ya + 2 * r * S
+            d.ellipse([xa, ya, xa + 2 * r * S, yb], fill=255)
+            d.ellipse([xb - 2 * r * S, ya, xb, yb], fill=255)
+            d.rectangle([xa + r * S, ya, xb - r * S, yb], fill=255)
+        m = self._aa_mask(k, W, H, draw)
+        self.canvas.create_image(left, top, image=self._aa_photo(k, m, col), anchor="nw",
+                                 tags="dyn")
+
+    def aa_frame(self):
+        cur = self.__dict__.setdefault("_aa_cur", {})
+        if len(cur) > 700:                      # keep two generations so on-screen images live
+            self._aa_old, self._aa_cur = cur, {}
+
+    def aa_circle(self, cx, cy, r, col):
+        r = round(r * 2) / 2
+
+        def paint(d, P):
+            d.ellipse([*P(-r, -r), *P(r, r)], fill=255)
+        self.aa_blit(("circle", r), int(r) + 2, cx, cy, col, paint)
+
+    def _poly_line(self, d, P, pts, w, arrow=None):
+        """Round-capped, round-joined stroke; optional Tk-style arrow head at the last point."""
+        S = self.AA
+        pts = list(pts)
+        if arrow:
+            d1, d2, d3 = arrow
+            (x0, y0), (x1, y1) = pts[-2], pts[-1]
+            L = math.hypot(x1 - x0, y1 - y0) or 1.0
+            ux, uy = (x1 - x0) / L, (y1 - y0) / L
+            nx, ny = -uy, ux
+            hw = w / 2 + d3
+            head = [P(x1, y1), P(x1 - ux * d2 + nx * hw, y1 - uy * d2 + ny * hw),
+                    P(x1 - ux * d1, y1 - uy * d1), P(x1 - ux * d2 - nx * hw, y1 - uy * d2 - ny * hw)]
+            pts[-1] = (x1 - ux * d1, y1 - uy * d1)
+            d.polygon(head, fill=255)
+        sp = [P(x, y) for x, y in pts]
+        d.line(sp, fill=255, width=max(1, int(w * S)), joint="curve")
+        rr = w * S / 2
+        for x, y in sp:
+            d.ellipse([x - rr, y - rr, x + rr, y + rr], fill=255)
+
+    def _rbox(self, d, P, x0, y0, x1, y1, rad):
+        if hasattr(d, "rounded_rectangle"):
+            d.rounded_rectangle([*P(x0, y0), *P(x1, y1)], radius=rad * self.AA, fill=255)
+        else:
+            d.rectangle([*P(x0, y0), *P(x1, y1)], fill=255)
+
     def icon_shuffle(self, cx, cy, u, col, w):
         a = (u * .55, u * .62, u * .30)
-        self.canvas.create_line(cx - u, cy + u * .55, cx - u * .35, cy + u * .55,
-                                cx + u * .35, cy - u * .55, cx + u, cy - u * .55,
-                                fill=col, width=w, arrow="last", arrowshape=a,
-                                joinstyle="round", capstyle="round", tags="dyn")
-        self.canvas.create_line(cx - u, cy - u * .55, cx - u * .35, cy - u * .55,
-                                cx + u * .35, cy + u * .55, cx + u, cy + u * .55,
-                                fill=col, width=w, arrow="last", arrowshape=a,
-                                joinstyle="round", capstyle="round", tags="dyn")
+
+        def paint(d, P):
+            self._poly_line(d, P, [(-u, u * .55), (-u * .35, u * .55), (u * .35, -u * .55),
+                                   (u, -u * .55)], w, a)
+            self._poly_line(d, P, [(-u, -u * .55), (-u * .35, -u * .55), (u * .35, u * .55),
+                                   (u, u * .55)], w, a)
+        self.aa_blit(("shuffle", round(u, 2), w), math.ceil(1.5 * u + w) + 2, cx, cy, col, paint)
 
     def icon_repeat(self, cx, cy, u, col, w, one=False):
         a = (u * .5, u * .58, u * .28)
-        self.canvas.create_line(cx - u, cy + u * .2, cx - u, cy - u * .5, cx + u * .7, cy - u * .5,
-                                fill=col, width=w, arrow="last", arrowshape=a,
-                                joinstyle="round", capstyle="round", tags="dyn")
-        self.canvas.create_line(cx + u, cy - u * .2, cx + u, cy + u * .5, cx - u * .7, cy + u * .5,
-                                fill=col, width=w, arrow="last", arrowshape=a,
-                                joinstyle="round", capstyle="round", tags="dyn")
+
+        def paint(d, P):
+            self._poly_line(d, P, [(-u, u * .2), (-u, -u * .5), (u * .7, -u * .5)], w, a)
+            self._poly_line(d, P, [(u, -u * .2), (u, u * .5), (-u * .7, u * .5)], w, a)
+            if one:
+                r = u * .5
+                bx, by = u * .95, -u * .85
+                d.ellipse([*P(bx - r, by - r), *P(bx + r, by + r)], fill=255)
+        self.aa_blit(("repeat", round(u, 2), w, one), math.ceil(1.9 * u + w) + 2, cx, cy, col, paint)
         if one:
-            r = u * .5
-            bx, by = cx + u * .95, cy - u * .85
-            self.canvas.create_oval(bx - r, by - r, bx + r, by + r, fill=col, outline="",
-                                    tags="dyn")
-            self.canvas.create_text(bx, by, text="1", font=self.geo["f_badge"],
+            self.canvas.create_text(cx + u * .95, cy - u * .85, text="1", font=self.geo["f_badge"],
                                     fill=hexc((12, 12, 18)), tags="dyn")
 
     def icon_speaker(self, cx, cy, u, col, w, level, muted):
-        c = self.canvas
-        x = cx - u * .35
-        c.create_polygon(x - u * .75, cy - u * .32, x - u * .3, cy - u * .32, x + u * .2, cy - u * .8,
-                         x + u * .2, cy + u * .8, x - u * .3, cy + u * .32, x - u * .75, cy + u * .32,
-                         fill=col, outline="", tags="dyn")
-        if muted:
-            m = u * .32
-            ox = x + u * .85
-            c.create_line(ox - m, cy - m, ox + m, cy + m, fill=col, width=w, capstyle="round",
-                          tags="dyn")
-            c.create_line(ox - m, cy + m, ox + m, cy - m, fill=col, width=w, capstyle="round",
-                          tags="dyn")
-            return
-        for i, rr in enumerate((.55, .95)):
-            if level > (.02 if i == 0 else .5):
-                r = u * rr
-                c.create_arc(x + u * .2 - r, cy - r, x + u * .2 + r, cy + r, start=-50, extent=100,
-                             style="arc", outline=col, width=w, tags="dyn")
+        x = -u * .35
+        arcs = tuple(level > (.02 if i == 0 else .5) for i in range(2))
+
+        def paint(d, P):
+            d.polygon([P(x - u * .75, -u * .32), P(x - u * .3, -u * .32), P(x + u * .2, -u * .8),
+                       P(x + u * .2, u * .8), P(x - u * .3, u * .32), P(x - u * .75, u * .32)],
+                      fill=255)
+            if muted:
+                m, ox = u * .32, x + u * .85
+                self._poly_line(d, P, [(ox - m, -m), (ox + m, m)], w)
+                self._poly_line(d, P, [(ox - m, m), (ox + m, -m)], w)
+                return
+            S = self.AA
+            for on, rr in zip(arcs, (.55, .95)):
+                if not on:
+                    continue
+                r, ox = u * rr, x + u * .2
+                R = (r + w / 2) * S
+                c0 = P(ox, 0)
+                d.arc([c0[0] - R, c0[1] - R, c0[0] + R, c0[1] + R], -50, 50, fill=255,
+                      width=max(1, int(w * S)))
+                for ang in (-50, 50):               # round caps
+                    ex, ey = ox + r * math.cos(math.radians(ang)), r * math.sin(math.radians(ang))
+                    px, py = P(ex, ey)
+                    q = w * S / 2
+                    d.ellipse([px - q, py - q, px + q, py + q], fill=255)
+        self.aa_blit(("speaker", round(u, 2), w, arcs, bool(muted)), math.ceil(1.6 * u + w) + 2,
+                     cx, cy, col, paint)
 
     def icon_list(self, cx, cy, u, col, w):
-        c = self.canvas
-        for i, dy in enumerate((-.55, 0, .55)):
-            c.create_oval(cx - u - 1.6, cy + dy * u - 1.6, cx - u + 1.6, cy + dy * u + 1.6,
-                          fill=col, outline="", tags="dyn")
-            c.create_line(cx - u * .45, cy + dy * u, cx + u, cy + dy * u, fill=col, width=w,
-                          capstyle="round", tags="dyn")
+        def paint(d, P):
+            for dy in (-.55, 0, .55):
+                r = 1.8
+                d.ellipse([*P(-u - r, dy * u - r), *P(-u + r, dy * u + r)], fill=255)
+                self._poly_line(d, P, [(-u * .45, dy * u), (u, dy * u)], w)
+        self.aa_blit(("list", round(u, 2), w), math.ceil(1.4 * u + w) + 2, cx, cy, col, paint)
 
     def icon_queue(self, cx, cy, u, col, w):
-        c = self.canvas
-        for dy in (-.6, 0):
-            c.create_line(cx - u, cy + dy * u, cx + u, cy + dy * u, fill=col, width=w,
-                          capstyle="round", tags="dyn")
-        c.create_polygon(cx - u, cy + .3 * u, cx - u, cy + 1.1 * u, cx - u * .3, cy + .7 * u,
-                         fill=col, outline="", tags="dyn")
-        c.create_line(cx + u * .1, cy + .7 * u, cx + u, cy + .7 * u, fill=col, width=w,
-                      capstyle="round", tags="dyn")
+        def paint(d, P):
+            for dy in (-.6, 0):
+                self._poly_line(d, P, [(-u, dy * u), (u, dy * u)], w)
+            d.polygon([P(-u, .3 * u), P(-u, 1.1 * u), P(-u * .3, .7 * u)], fill=255)
+            self._poly_line(d, P, [(u * .1, .7 * u), (u, .7 * u)], w)
+        self.aa_blit(("queue", round(u, 2), w), math.ceil(1.5 * u + w) + 2, cx, cy, col, paint)
 
     def icon_help(self, cx, cy, u, col, w):
-        self.canvas.create_oval(cx - u, cy - u, cx + u, cy + u, outline=col, width=w, tags="dyn")
+        def paint(d, P):
+            R = u + w / 2
+            d.ellipse([*P(-R, -R), *P(R, R)], fill=255)
+            r = u - w / 2
+            d.ellipse([*P(-r, -r), *P(r, r)], fill=0)
+        self.aa_blit(("help", round(u, 2), w), math.ceil(u + w) + 3, cx, cy, col, paint)
         self.canvas.create_text(cx, cy, text="?", font=self.geo["f_badge"], fill=col, tags="dyn")
+
+    def icon_stats(self, cx, cy, u, col, w):
+        def paint(d, P):
+            for i, hh in enumerate((.55, 1.0, .75)):
+                x = -u * .85 + i * u * .72
+                self._rbox(d, P, x, u * .9 - hh * u * 1.8, x + u * .5, u * .9, u * .12)
+        self.aa_blit(("stats", round(u, 2)), math.ceil(1.3 * u) + 2, cx, cy, col, paint)
+
+    @staticmethod
+    def heart_pts(u, n=56):
+        pts = []
+        for i in range(n):
+            t = 2 * math.pi * i / n
+            x = 16 * math.sin(t) ** 3
+            y = -(13 * math.cos(t) - 5 * math.cos(2 * t) - 2 * math.cos(3 * t) - math.cos(4 * t))
+            pts.append((x * u / 16, (y - 2.5) * u / 16))
+        return pts
+
+    def icon_heart(self, cx, cy, u, col, w, fill=None, fs=1.0):
+        """Smooth heart: an outline, plus an optional filled heart that grows inside it."""
+        u = round(u * 2) / 2
+        w = round(w, 1)
+        pts = self.heart_pts(u)
+
+        def outline(d, P):
+            self._poly_line(d, P, pts + [pts[0]], w)
+        self.aa_blit(("heart_o", u, w), math.ceil(u + w) + 3, cx, cy, col, outline)
+        uf = round(u * fs * 2) / 2
+        if fill and uf >= 1:
+            pf = self.heart_pts(uf)
+
+            def solid(d, P):
+                d.polygon([P(x, y) for x, y in pf], fill=255)
+            self.aa_blit(("heart_f", uf), math.ceil(u + w) + 3, cx, cy, fill, solid)
+
+    # transport glyphs
+    def icon_skip(self, cx, cy, u, col, s):
+        def paint(d, P):
+            self._rbox(d, P, s * u - u * .16, -u * .9, s * u + u * .16, u * .9, u * .08)
+            d.polygon([P(-s * u, -u * .9), P(-s * u, u * .9), P(s * u * .55, 0)], fill=255)
+        self.aa_blit(("skip", round(u, 2), s), math.ceil(1.4 * u) + 2, cx, cy, col, paint)
+
+    def icon_seek(self, cx, cy, u, col, s):
+        a0, a1 = (-1.05, -.1) if s == -1 else (1.05, .1)
+        b0, b1 = (-.1, .85) if s == -1 else (.1, -.85)
+
+        def paint(d, P):
+            d.polygon([P(a1 * u, -u * .75), P(a1 * u, u * .75), P(a0 * u, 0)], fill=255)
+            d.polygon([P(b1 * u, -u * .75), P(b1 * u, u * .75), P(b0 * u, 0)], fill=255)
+        self.aa_blit(("seek", round(u, 2), s), math.ceil(1.3 * u) + 2, cx, cy, col, paint)
+
+    def icon_playpause(self, cx, cy, u, col, playing):
+        def paint(d, P):
+            if playing:
+                for sx in (-.95, .35):
+                    self._rbox(d, P, u * sx, -u, u * (sx + .6), u, u * .12)
+            else:
+                d.polygon([P(-u * .7, -u), P(-u * .7, u), P(u * 1.05, 0)], fill=255)
+        self.aa_blit(("pp", round(u, 2), bool(playing)), math.ceil(1.3 * u) + 2, cx, cy, col, paint)
 
     def draw_controls(self, pos):
         c, g, tint, ua = self.canvas, self.geo, self.tint, self.ui_alpha
@@ -3897,6 +5494,7 @@ class App:
             c.create_text((x0 + x1) / 2, ty, text=" · ".join(mid), anchor="n", font=g["f_time"],
                           fill=hexc(mix(self.accent, WHITE, .45)), tags="dyn")
 
+        self.aa_frame()
         if ua > .03:
             r, cy = g["ctl_r"], g["ctl_cy"]
             hov = self.hover_hit[1] if self.hover_hit and self.hover_hit[0] == "btn" else None
@@ -3907,37 +5505,18 @@ class App:
                 if name == "play":
                     pr = r * (1.06 if hov == "play" else 1.0)
                     fillc = mix(tint, WHITE, ua)
-                    c.create_oval(cx - pr, cy - pr, cx + pr, cy + pr, fill=hexc(fillc),
-                                  outline="", tags="dyn")
-                    gc = hexc(mix(fillc, dark, ua))
-                    u = r * .45
-                    if self.playing:
-                        for sx in (-.95, .35):
-                            c.create_rectangle(cx + u * sx, cy - u, cx + u * (sx + .6), cy + u,
-                                               fill=gc, outline="", tags="dyn")
-                    else:
-                        c.create_polygon(cx - u * .7, cy - u, cx - u * .7, cy + u, cx + u * 1.05, cy,
-                                         fill=gc, outline="", tags="dyn")
+                    self.aa_circle(cx, cy, pr, hexc(fillc))
+                    self.icon_playpause(cx, cy, r * .45, hexc(mix(fillc, dark, ua)), self.playing)
                 elif name in ("prev", "next"):
-                    s = -1 if name == "prev" else 1
-                    c.create_rectangle(cx + s * u * 1.0 - u * .16, cy - u * .9,
-                                       cx + s * u * 1.0 + u * .16, cy + u * .9,
-                                       fill=col, outline="", tags="dyn")
-                    c.create_polygon(cx - s * u * 1.0, cy - u * .9, cx - s * u * 1.0, cy + u * .9,
-                                     cx + s * u * .55, cy, fill=col, outline="", tags="dyn")
+                    self.icon_skip(cx, cy, u, col, -1 if name == "prev" else 1)
                 else:
-                    s = -1 if name == "back" else 1
-                    a0, a1 = (-1.05, -.1) if s == -1 else (1.05, .1)
-                    b0, b1 = (-.1, .85) if s == -1 else (.1, -.85)
-                    c.create_polygon(cx + a1 * u, cy - u * .75, cx + a1 * u, cy + u * .75,
-                                     cx + a0 * u, cy, fill=col, outline="", tags="dyn")
-                    c.create_polygon(cx + b1 * u, cy - u * .75, cx + b1 * u, cy + u * .75,
-                                     cx + b0 * u, cy, fill=col, outline="", tags="dyn")
+                    s_ = -1 if name == "back" else 1
+                    self.icon_seek(cx, cy, u, col, s_)
                     c.create_text(cx, cy + u * 1.9, text=f"{float(SETTINGS['seek_step']):g}",
                                   font=g["f_time"], fill=col, tags="dyn")
             self.draw_util_row(ua)
 
-        if not self.auto_follow and self.lines and not self.pl_open:
+        if not self.auto_follow and self.lines and self.synced and not self.pl_open:
             x0p, y0p, x1p, y1p = g["pill"]
             hp = self.hover_hit and self.hover_hit[0] == "pill"
             self.rrect(x0p, y0p, x1p, y1p, (y1p - y0p) / 2, tags="dyn", outline="",
@@ -3947,9 +5526,11 @@ class App:
         if ua > .05 and SETTINGS["show_hint"] and not self.pl_open:
             bits = []
             if self.lyric_source:
-                bits.append(f"Lyrics: {self.lyric_source}")
-            bits += ["Scroll to browse", "Click a line to jump", "P playlists", "S settings",
-                     "? shortcuts"]
+                bits.append(f"Lyrics: {self.lyric_source}" + ("" if self.synced else " (unsynced)"))
+            bits.append("Scroll to browse")
+            if self.synced:
+                bits.append("Click a line to jump")
+            bits += ["L like", "E lyrics", "P playlists", "S settings", "? shortcuts"]
             c.create_text(g["lx"], g["h"] - int(g["h"] * .04), text="   ·   ".join(bits),
                           anchor="sw", font=g["f_hint"],
                           fill=hexc(mix(tint, WHITE, .33 * ua)), tags="dyn")
@@ -3976,13 +5557,10 @@ class App:
 
         def dot(cx, cy, on):
             if on:
-                c.create_oval(cx - 2, cy + u * 1.45 - 2, cx + 2, cy + u * 1.45 + 2,
-                              fill=hexc(mix(tint, acc, ua)), outline="", tags="dyn")
+                self.aa_circle(cx, cy + u * 1.45, 2, hexc(mix(tint, acc, ua)))
         for name, cx, cy, r in g["util"]:
             if hov == name:
-                rr = r * .95
-                c.create_oval(cx - rr, cy - rr, cx + rr, cy + rr,
-                              fill=hexc(mix(tint, WHITE, .10 * ua)), outline="", tags="dyn")
+                self.aa_circle(cx, cy, r * .95, hexc(mix(tint, WHITE, .10 * ua)))
             if name == "shuffle":
                 on = self.shuffle_on()
                 self.icon_shuffle(cx, cy, u, colr(name, on), w)
@@ -3996,6 +5574,8 @@ class App:
                 v = self.vol
                 self.icon_speaker(cx, cy, u, colr(name), w, vol_frac(v) if v else 0,
                                   bool(v and v.get("isMuted")))
+            elif name == "stats":
+                self.icon_stats(cx, cy, u, colr(name, self.lib_open), w)
             elif name == "queue":
                 on = bool(self.queue_items)
                 self.icon_queue(cx, cy, u, colr(name, on), w)
@@ -4010,17 +5590,59 @@ class App:
             f = 0.0 if self.vol.get("isMuted") else vol_frac(self.vol)
             active = self.vol_dragging or (self.hover_hit and self.hover_hit[0] == "vol")
             th = max(4, int(g["h"] * .006)) if active else max(3, int(g["h"] * .0042))
-            c.create_line(vx0, vy, vx1, vy, width=th, capstyle="round",
-                          fill=hexc(mix(tint, WHITE, .18 * ua)), tags="dyn")
+            self.aa_capsule(vx0, vx1, vy, th, hexc(mix(tint, WHITE, .18 * ua)))
             xf = vx0 + (vx1 - vx0) * f
             if f > 0:
-                c.create_line(vx0, vy, max(vx0 + .1, xf), vy, width=th, capstyle="round",
-                              fill=hexc(mix(tint, WHITE, .78 * ua)), tags="dyn")
+                self.aa_capsule(vx0, max(vx0 + .1, xf), vy, th, hexc(mix(tint, WHITE, .78 * ua)))
             if active:
                 r = th * 1.2
-                c.create_oval(xf - r, vy - r, xf + r, vy + r, fill="#ffffff", outline="", tags="dyn")
+                self.aa_circle(xf, vy, r, "#ffffff")
                 c.create_text(xf, vy - r - 5, text=vol_label(self.vol).replace("Volume ", ""),
                               anchor="s", font=g["f_time"], fill="#ffffff", tags="dyn")
+
+    def draw_like(self, now, dt):
+        if self.track_key is None:
+            return
+        hx, hy, hr = self.geo["heart"]
+        on = LIB.is_liked(self.track[0], self.track[1])
+        tgt = 1.0 if on else 0.0
+        self.like_anim += (tgt - self.like_anim) * (1 - math.exp(-dt * 14))
+        if abs(tgt - self.like_anim) < .01:
+            self.like_anim = tgt
+        a = self.like_anim
+        t0, sign = self.like_pop
+        p = (now - t0) / .5
+        s = 1.0
+        if sign and 0 <= p < 1:
+            s = (1 + .30 * math.sin(math.pi * p) * (1 - .35 * p)) if sign > 0 \
+                else 1 - .14 * math.sin(math.pi * p)
+            if sign > 0 and p < .7:                   # soft burst ring
+                rr = hr * (1.0 + 1.1 * p)
+                self.canvas.create_oval(hx - rr, hy - rr, hx + rr, hy + rr, width=2, tags="dyn",
+                                        outline=hexc(mix(HEART, self.tint, p / .7)))
+        hov = self.hover_hit == ("like", None)
+        if hov:
+            s *= 1.08
+        off = mix(self.tint, WHITE, .92 if hov else .62)
+        self.icon_heart(hx, hy, hr * .9 * s, hexc(mix(off, HEART, a)), max(2.0, hr * .13),
+                        fill=hexc(HEART), fs=ease_out(a))
+
+    def track_stats(self, now):
+        """Counts real listening time; a play counts once 80 % of the song was heard."""
+        last, self._st_t = self._st_t, now
+        if self.connected and self.state == "stopped":
+            self.heard, self.counted = 0.0, 0
+        if (last is None or not (self.connected and self.playing and self.track_key)
+                or self.duration <= 0):
+            return
+        d = min(1.0, now - last)
+        self.heard += d
+        LIB.add_time(d)
+        n = int((self.heard + .2 * self.duration) / self.duration)   # 0.8, 1.8, 2.8 … (repeat-one)
+        while self.counted < n:
+            self.counted += 1
+            LIB.add_play(self.track[0], self.track[1])
+        LIB.autosave()
 
     # ---- up next
     def compute_next_sig(self):
@@ -4335,7 +5957,11 @@ class App:
         numw = P["numw"]
         ft, ftb, fs, fn = g["f_pl_title"], g["f_pl_title_b"], g["f_pl_sub"], g["f_pl_num"]
         dur_w = fn.measure("00:00:00")
-        text_x = rx0 + numw + 26
+        art_on = bool(SETTINGS["playlist_artwork"])
+        art_s = max(22, int(rh - 14)) if art_on else 0
+        if len(self.pl_art_photos) > 400:          # evict before drawing, never mid-frame
+            self.pl_art_photos.clear()
+        text_x = (rx0 + 12 + art_s + 14) if art_on else (rx0 + numw + 26)
         hov = self.hover_hit[1] if self.hover_hit and self.hover_hit[0] == "plrow" else None
         viewing_playing = self.pl_view_id == self.play_pl_id
         sel_fill = hexc(mix(base, self.accent, .36))
@@ -4361,11 +5987,25 @@ class App:
                 self.rrect(rx0, top + 2, rx1, top + rh - 2, 10, fill="",
                            outline=hexc(mix(base, WHITE, .22)), tags="dyn")
             cy = top + rh / 2
-            ncx = rx0 + 12 + numw / 2
-            if playing_row:
-                self.draw_eq(ncx, cy, rh * .3, acc_txt if not selected else "#ffffff", now)
+            if art_on:
+                ax = rx0 + 12
+                ph = self.pl_art_photo(it, real, art_s, playing_row)
+                if ph:
+                    c.create_image(ax, cy - art_s / 2, image=ph, anchor="nw", tags="dyn")
+                else:                                # loading / no artwork: tile with the number
+                    self.rrect(ax, cy - art_s / 2, ax + art_s, cy + art_s / 2, art_s * .16,
+                               fill=hexc(mix(base, WHITE, .07)), outline="", tags="dyn")
+                ncx = ax + art_s / 2
+                if playing_row:
+                    self.draw_eq(ncx, cy, art_s * .42, "#ffffff", now)
+                elif not ph:
+                    c.create_text(ncx, cy, text=str(real + 1), font=fn, fill=dimmer, tags="dyn")
             else:
-                c.create_text(ncx, cy, text=str(real + 1), font=fn, fill=dimmer, tags="dyn")
+                ncx = rx0 + 12 + numw / 2
+                if playing_row:
+                    self.draw_eq(ncx, cy, rh * .3, acc_txt if not selected else "#ffffff", now)
+                else:
+                    c.create_text(ncx, cy, text=str(real + 1), font=fn, fill=dimmer, tags="dyn")
             right = rx1 - 12
             c.create_text(right, cy, text=it[3], anchor="e", font=fn, fill=dim, tags="dyn")
             right -= dur_w * .75 + 10
@@ -4437,6 +6077,8 @@ class App:
         elif self.menu:
             lay = self.menu.get("lay")
             want = "hand2" if lay and self.menu_hover_index(lay) >= 0 else "arrow"
+        elif self.lib_open:
+            want = "hand2" if self.lib_hit_at(self.mx, self.my) else "arrow"
         elif self.settings_open:
             want = "hand2" if self.settings_button_hover() else "arrow"
         elif self.help_open:
@@ -4479,6 +6121,7 @@ class App:
         if self.connected != self.prev_connected:
             self.prev_connected = self.connected
             self.static_dirty = True
+        self.track_stats(now)
         w, h = self.canvas.winfo_width(), self.canvas.winfo_height()
         if w < 300 or h < 200:
             return
@@ -4522,11 +6165,13 @@ class App:
             self.draw_scrim()
             self.draw_settings()
             self.draw_help()
+            self.draw_library(now)
             self.draw_modal()
         else:
             self.draw_lyrics()
             self.draw_controls(pos)
             self.draw_up_next(pos, dt)
+            self.draw_like(now, dt)
             self.draw_playlist(now)
         self.draw_menu()
         self.draw_toast(now)
