@@ -1,6 +1,8 @@
 # foobar_fullscreen_lyrics
-Development note: This project was developed with significant assistance from multiple AI tools/models. The design, implementation, debugging, and iteration were done through a combination of my own direction and AI-assisted development.  
 A fullscreen lyrics app for foobar2000 x86, made to provide a fullscreen music/lyrics experience without needing to work around SMTC or Windows media controls.
+## Development note
+1-This project was developed with significant assistance from multiple AI tools/models. The design, implementation, debugging, and iteration were done through a combination of my own direction and AI-assisted development.  
+2-this project is mainly for learning a bunch of programming concepts but ur free to do pull requests
 
 ## General requirements
 
